@@ -1,0 +1,13 @@
+[server]
+host = "127.0.0.1"
+port = 18445
+cert_path = "certs/server.pem"
+key_path = "certs/server.key"
+
+[redis]
+url = "redis://127.0.0.1:16379"
+
+[[targets]]
+host = "localhost"
+port = 19997
+tls = false

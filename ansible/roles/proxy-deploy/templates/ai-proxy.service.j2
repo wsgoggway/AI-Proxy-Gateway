@@ -1,0 +1,18 @@
+[Unit]
+Description=AI Proxy - Secure Corporate Gateway
+After=network.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nogroup
+WorkingDirectory=/opt/ai-proxy
+Environment="AI_PROXY_CONFIG=/etc/ai-proxy/config.toml"
+Environment="RUST_LOG=ai_proxy=info"
+ExecStart=/opt/ai-proxy/ai-proxy
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

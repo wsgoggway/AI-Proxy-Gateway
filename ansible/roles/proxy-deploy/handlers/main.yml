@@ -1,0 +1,5 @@
+- name: restart proxy
+  systemd:
+    name: ai-proxy
+    state: restarted
+    daemon_reload: yes

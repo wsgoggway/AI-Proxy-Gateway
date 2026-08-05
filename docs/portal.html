@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Proxy Gateway</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Ubuntu:wght@400;500;700&family=Ubuntu+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: "Ubuntu", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0d1117; color: #c9d1d9; line-height: 1.6; }
+  .container { max-width: 780px; margin: 0 auto; padding: 40px 20px; }
+  .header { text-align: center; margin-bottom: 32px; }
+  h1 { font-size: 30px; color: #58a6ff; margin-bottom: 6px; }
+  .subtitle { color: #8b949e; font-size: 17px; }
+  .addr-badge { display: inline-block; background: #0d3320; color: #3fb950; border: 1px solid #238636; border-radius: 6px; padding: 3px 12px; font-size: 16px; font-weight: 600; margin-top: 8px; font-family: "Ubuntu Mono", monospace; }
+  .quick { background: #161b22; border: 2px solid #238636; border-radius: 10px; padding: 20px; margin-bottom: 28px; text-align: center; }
+  .quick h2 { color: #3fb950; font-size: 19px; margin-bottom: 10px; border: none; }
+  .quick pre { text-align: left; margin: 0; }
+  h2 { font-size: 20px; color: #f0f6fc; margin: 28px 0 12px; border-bottom: 1px solid #21262d; padding-bottom: 6px; }
+  .step { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px 16px; margin-bottom: 10px; }
+  .step-num { display: inline-block; background: #1f6feb; color: #fff; border-radius: 50%; width: 20px; height: 20px; text-align: center; line-height: 20px; font-size: 14px; font-weight: bold; margin-right: 8px; }
+  .step-title { font-weight: 600; color: #f0f6fc; }
+  code { background: #0d1117; border: 1px solid #30363d; border-radius: 4px; padding: 1px 5px; font-size: 15px; color: #7ee787; font-family: "Ubuntu Mono", "SF Mono", Menlo, Monaco, monospace; }
+  pre { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 10px 14px; overflow-x: auto; font-size: 15px; margin-top: 8px; }
+  pre code { border: none; padding: 0; background: none; display: block; color: #c9d1d9; }
+  .note { background: #0d1f33; border: 1px solid #1f6feb; border-radius: 6px; padding: 10px 14px; margin: 10px 0; font-size: 16px; color: #79c0ff; }
+  .warn { background: #2a1f0d; border: 1px solid #d29922; border-radius: 6px; padding: 10px 14px; margin: 10px 0; font-size: 16px; color: #d29922; }
+  table { width: 100%; border-collapse: collapse; font-size: 16px; }
+  td { padding: 5px 8px; border-bottom: 1px solid #21262d; color: #8b949e; }
+  td:first-child { color: #7ee787; font-family: "Ubuntu Mono", monospace; }
+  .footer { margin-top: 40px; padding-top: 14px; border-top: 1px solid #21262d; color: #484f58; font-size: 15px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<div class="header">
+  <h1>AI Proxy Gateway</h1>
+  <p class="subtitle">MITM-прокси с DPI — секреты и PII токенизируются только для AI-API</p>
+  <div class="addr-badge" id="addr"></div>
+</div>
+
+<!-- ─── Quick Start ─── -->
+<div class="quick">
+  <h2>Быстрый старт (без root)</h2>
+  <pre><code class="proxy-cmd"># 1. Установка
+curl -sS http://%%ADDR%%/install.sh | bash
+export PATH="$HOME/.local/bin:$PATH"
+
+# 2. Вход (если требуется авторизация)
+apx login --host %%ADDR%% --user <your-user>
+
+# 3. Проверка
+apx check
+
+# 4. Запуск агентов
+apx run pi
+apx run claude
+apx run aider --model deepseek/deepseek-chat</code></pre>
+</div>
+
+<div class="note">
+  <strong>Авторизация (v0.2)</strong> — прокси поддерживает <code>Proxy-Authorization: Basic</code>.
+  Анонимный доступ отключён (407). Вход через <code>apx login</code>,
+  который сохраняет креды в <code>~/.config/ai-proxy/env.conf</code> (chmod 600)
+  и инжектит их в <code>HTTPS_PROXY=http://user:pass@host:port</code>.
+  Также доступны <code>apx logout</code> и <code>apx whoami</code>.
+</div>
+
+<!-- ─── How routing works ─── -->
+<h2>Как работает маршрутизация</h2>
+<p style="color:#8b949e;font-size:16px">
+  <strong>AI-домены</strong> (DeepSeek, OpenAI, Anthropic и др.) → через прокси с DPI-токенизацией.<br>
+  <strong>Весь остальной трафик</strong> → напрямую, прокси не задействован.<br>
+  DPI маскирует секреты, email, имена, телефоны — токенизируются до того, как покинут сеть.
+</p>
+
+<!-- ─── Step-by-step ─── -->
+<h2>Пошаговая настройка</h2>
+
+<div class="step">
+  <span class="step-num">1</span>
+  <span class="step-title">Установка</span>
+  <pre><code class="proxy-cmd">curl -sS http://%%ADDR%%/install.sh | bash</code></pre>
+  <p style="color:#8b949e;font-size:15px;margin:6px 0">
+    Скрипт определяет ОС и архитектуру, скачивает <code>apx</code> в <code>~/.local/bin</code>,
+    CA-сертификат, собирает CA bundle и пишет конфиг.
+    Системное хранилище сертификатов не меняется.
+    На macOS CA добавляется в связку ключей пользователя (без sudo).
+  </p>
+  <div class="warn">Не забудьте <code>export PATH="$HOME/.local/bin:$PATH"</code>.</div>
+</div>
+
+<div class="step">
+  <span class="step-num">2</span>
+  <span class="step-title">Авторизация</span>
+  <pre><code>apx login --host %%ADDR%% [--user USER]
+# или non-interactive:
+apx --host %%ADDR%% login --user USER --pass PASS</code></pre>
+  <p style="color:#8b949e;font-size:15px;margin:6px 0">
+    Верификация через CONNECT-хендшейк (Proxy-Authorization: Basic).
+    Креды сохраняются в <code>~/.config/ai-proxy/env.conf</code> (0600).
+    При отсутствии кредов прокси возвращает 407.
+  </p>
+</div>
+
+<div class="step">
+  <span class="step-num">3</span>
+  <span class="step-title">Проверка</span>
+  <pre><code>apx check
+# OK    proxy reachable
+# OK    CA downloaded
+# OK    CA validates as X.509
+# OK    CA bundle present
+# OK    CA in bundle
+# OK    sandbox/isolation
+# OK    config present</code></pre>
+</div>
+
+<div class="step">
+  <span class="step-num">4</span>
+  <span class="step-title">Запуск агентов</span>
+  <pre><code>apx run pi
+apx run claude
+apx run opencode
+apx run aider --model deepseek/deepseek-chat
+apx run --sandbox codex       # Rust/Electron (bwrap на Linux)
+apx shell                     # интерактивный шелл через прокси</code></pre>
+</div>
+
+<div class="step">
+  <span class="step-num">5</span>
+  <span class="step-title">Обёртки и автодополнение (опционально)</span>
+  <pre><code>apx aliases --install
+source ~/.zshrc
+eval "$(apx completion bash)"   # или zsh, fish
+
+# Теперь можно просто:
+pi                    # вместо apx run pi
+opencode              # вместо apx run opencode</code></pre>
+</div>
+
+<!-- ─── Agents ─── -->
+<h2>AI-агенты</h2>
+<div class="step">
+  <table>
+    <tr><td>Агент</td><td>Runtime</td><td>Команда</td></tr>
+    <tr><td>Claude Code</td><td>Node.js</td><td><code>apx run claude</code></td></tr>
+    <tr><td>Pi</td><td>Node.js</td><td><code>apx run pi</code></td></tr>
+    <tr><td>OpenCode</td><td>Node.js</td><td><code>apx run opencode</code></td></tr>
+    <tr><td>Gemini CLI</td><td>Node.js</td><td><code>apx run gemini</code></td></tr>
+    <tr><td>Aider</td><td>Python</td><td><code>apx run aider</code></td></tr>
+    <tr><td>Codex CLI</td><td>Rust</td><td><code>apx run --sandbox codex</code></td></tr>
+    <tr><td>Cursor</td><td>Electron</td><td><code>apx run --sandbox cursor</code></td></tr>
+  </table>
+</div>
+
+<!-- ─── Troubleshooting ─── -->
+<h2>Решение проблем</h2>
+<div class="step">
+  <table>
+    <tr><td>command not found: apx</td><td><code>export PATH="$HOME/.local/bin:$PATH"</code></td></tr>
+    <tr><td>CONNECT tunnel failed: 407</td><td>нужна авторизация: <code>apx login</code></td></tr>
+    <tr><td>tls handshake eof</td><td>CA не доверена: <code>apx install</code></td></tr>
+    <tr><td>SSL-ошибка Python</td><td>bundle не собран: <code>apx install</code></td></tr>
+    <tr><td>Codex не работает (Linux)</td><td>нужен bwrap: <code>apx run --sandbox codex</code></td></tr>
+  </table>
+</div>
+
+<!-- ─── Endpoints ─── -->
+<h2>Эндпоинты</h2>
+<div class="step">
+  <table>
+    <tr><td>/</td><td>Эта страница</td></tr>
+    <tr><td>/ca.pem</td><td>CA-сертификат</td></tr>
+    <tr><td>/install.sh</td><td>Установщик</td></tr>
+    <tr><td>/cli/apx-{os}-{arch}</td><td>Бинарник apx</td></tr>
+    <tr><td>/metrics</td><td>Prometheus-метрики</td></tr>
+    <tr><td>/proxy.pac</td><td>PAC-файл (браузер)</td></tr>
+  </table>
+</div>
+
+<div class="footer">
+  AI Proxy v0.2 — секреты токенизируются до того, как покинут сеть
+</div>
+
+</div>
+
+<script>
+const addr = window.location.host;
+document.getElementById('addr').textContent = addr;
+document.querySelectorAll('.proxy-cmd, pre code').forEach(el => {
+  el.innerHTML = el.innerHTML.replace(/%%ADDR%%/g, addr);
+});
+</script>
+</body>
+</html>

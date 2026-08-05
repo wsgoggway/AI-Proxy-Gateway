@@ -1,0 +1,7 @@
+# Deploy AI Proxy to the target server.
+# Usage: ansible-playbook -i inventory.ini deploy.yml
+
+- name: Deploy AI Proxy
+  hosts: proxy
+  roles:
+    - proxy-deploy

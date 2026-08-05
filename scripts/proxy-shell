@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# proxy-shell — run a command (or an interactive shell) inside a bubblewrap
+# sandbox whose CA bundle is (system roots + AI Proxy CA).
+#
+# The host trust store is NEVER modified. Inside the sandbox the merged bundle
+# is bound over /etc/ssl/certs/ca-certificates.crt (and the RHEL path), so
+# runtimes that read ONLY the system store just work:
+#
+#   * Rust / reqwest / native-tls / rustls  -> Codex CLI
+#   * Chromium / Electron (NSS)             -> Cursor
+#   * Go crypto/x509
+#
+# Node.js / Python also get the env vars set, so they work too. In short:
+# proxy-shell is the universal no-root path; with-proxy is the lighter one for
+# Node/Python.
+#
+# Requires: bubblewrap (bwrap).
+#
+# Usage:
+#   proxy-shell                      # interactive shell, fully proxied
+#   proxy-shell codex
+#   proxy-shell -- claude
+#   AI_PROXY_HOST=your-proxy.example.com proxy-shell codex
+set -euo pipefail
+
+command -v bwrap >/dev/null 2>&1 || {
+  echo "proxy-shell: 'bwrap' (bubblewrap) not found." >&2
+  echo "  Arch:   sudo pacman -S bubblewrap" >&2
+  echo "  Debian: sudo apt-get install -y bubblewrap" >&2
+  echo "  Fedora: sudo dnf install -y bubblewrap" >&2
+  exit 127
+}
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=proxy-env
+. "$SCRIPT_DIR/proxy-env"
+
+# Build a private cert dir: copy of the host /etc/ssl/certs (so the hashed
+# symlinks used by OpenSSL survive) with the merged bundle written over the
+# bundle file. Bound read-only over the real path inside the sandbox.
+CERT_TMP="$(mktemp -d -t ai-proxy-certs.XXXXXX)"
+trap 'rm -rf "$CERT_TMP"' EXIT
+
+if [ -d /etc/ssl/certs ]; then
+  cp -a /etc/ssl/certs/. "$CERT_TMP"/ 2>/dev/null || true
+fi
+# Overwrite/seed the Debian/Arch/Alpine bundle. The copied entry may be a
+# symlink (Arch: ca-certificates.crt -> ca-bundle.crt) so remove it first and
+# write a regular file.
+rm -f "$CERT_TMP/ca-certificates.crt"
+cp "$BUNDLE" "$CERT_TMP/ca-certificates.crt"
+
+# RHEL/Fedora layout. Only bind when /etc/pki is a real directory.
+_RH_BIND=()
+if [ -d /etc/pki/tls/certs ]; then
+  mkdir -p "$CERT_TMP/pki/tls/certs"
+  rm -f "$CERT_TMP/pki/tls/certs/ca-bundle.crt"
+  cp "$BUNDLE" "$CERT_TMP/pki/tls/certs/ca-bundle.crt"
+  _RH_BIND=(--ro-bind "$CERT_TMP/pki/tls/certs/ca-bundle.crt" /etc/pki/tls/certs/ca-bundle.crt)
+fi
+
+# Command to run: strip a leading "--" separator if present, then explicit
+# args or an interactive $SHELL.
+if [ "${1:-}" = "--" ]; then shift; fi
+if [ "$#" -gt 0 ]; then RUN=("$@"); else RUN=("$SHELL"); fi
+
+# Sandbox layout:
+#   --ro-bind / /      read-only host root (binaries, libs, /etc/resolv.conf)
+#   --dev /dev         fresh devtmpfs (urandom, null, ...)
+#   --proc /proc       fresh procfs
+#   --tmpfs /tmp       writable scratch, private to the sandbox
+#   --bind $HOME $HOME writable home (agent caches/config survive)
+#   --ro-bind $CERT_TMP /etc/ssl/certs   our merged CA bundle
+bwrap \
+  --ro-bind / / \
+  --dev /dev \
+  --proc /proc \
+  --tmpfs /tmp \
+  --bind "$HOME" "$HOME" \
+  --ro-bind "$CERT_TMP" /etc/ssl/certs \
+  "${_RH_BIND[@]}" \
+  --setenv HTTPS_PROXY        "$HTTPS_PROXY" \
+  --setenv HTTP_PROXY         "$HTTP_PROXY" \
+  --setenv NO_PROXY           "$NO_PROXY" \
+  --setenv SSL_CERT_FILE      "/etc/ssl/certs/ca-certificates.crt" \
+  --setenv REQUESTS_CA_BUNDLE "/etc/ssl/certs/ca-certificates.crt" \
+  --setenv CURL_CA_BUNDLE     "/etc/ssl/certs/ca-certificates.crt" \
+  --setenv GIT_SSL_CAINFO     "/etc/ssl/certs/ca-certificates.crt" \
+  --setenv NODE_EXTRA_CA_CERTS "$AI_PROXY_CA_FILE" \
+  --setenv NODE_OPTIONS       "${NODE_OPTIONS:-}" \
+  --die-with-parent --new-session \
+  -- "${RUN[@]}"

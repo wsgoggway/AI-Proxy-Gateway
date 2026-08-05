@@ -1,0 +1,6 @@
+[tools]
+rust = "latest"
+node = "lts"
+
+[env]
+RUST_BACKTRACE = "1"

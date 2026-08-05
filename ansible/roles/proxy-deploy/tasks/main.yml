@@ -1,0 +1,74 @@
+---
+- name: Create proxy directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - /opt/ai-proxy
+    - /opt/ai-proxy/certs
+    - /etc/ai-proxy
+
+- name: Copy proxy binary
+  copy:
+    src: "{{ playbook_dir }}/../proxy/target/release/ai-proxy"
+    dest: /opt/ai-proxy/ai-proxy
+    mode: "0755"
+  notify: restart proxy
+
+- name: Copy config
+  template:
+    src: config.toml.j2
+    dest: /etc/ai-proxy/config.toml
+    mode: "0644"
+
+- name: Copy CA cert if exists
+  copy:
+    src: "{{ playbook_dir }}/../proxy/certs/ca.pem"
+    dest: /opt/ai-proxy/certs/ca.pem
+    mode: "0644"
+  failed_when: false
+
+- name: Copy CA key if exists
+  copy:
+    src: "{{ playbook_dir }}/../proxy/certs/ca.key"
+    dest: /opt/ai-proxy/certs/ca.key
+    mode: "0600"
+  failed_when: false
+
+- name: Fix cert ownership for nobody user
+  file:
+    path: /opt/ai-proxy/certs
+    owner: nobody
+    group: nogroup
+    recurse: yes
+
+- name: Install systemd service
+  template:
+    src: ai-proxy.service.j2
+    dest: /etc/systemd/system/ai-proxy.service
+    mode: "0644"
+  notify: restart proxy
+
+- name: Enable and start proxy
+  systemd:
+    name: ai-proxy
+    enabled: yes
+    state: started
+    daemon_reload: yes
+
+- name: Wait for proxy to start
+  wait_for:
+    port: "{{ proxy_port | default(8443) }}"
+    timeout: 10
+
+- name: Verify proxy health
+  uri:
+    url: "http://localhost:{{ proxy_port | default(8443) }}/ca.pem"
+    return_content: yes
+  register: health_check
+  failed_when: "'BEGIN CERTIFICATE' not in health_check.content"
+
+- name: Show CA install command for test VM
+  debug:
+    msg: "CA доступен: с root — curl -sS http://{{ ansible_host }}:{{ proxy_port | default(8443) }}/install.sh | sudo bash ; без root — curl -sS http://{{ ansible_host }}:{{ proxy_port | default(8443) }}/install-user.sh | bash"

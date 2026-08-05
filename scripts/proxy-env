@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# proxy-env — source this to route the current shell through AI Proxy.
+#
+# Downloads the MITM CA (if missing), verifies it, builds a CA bundle that is
+# (system roots + AI Proxy CA) and exports per-process environment variables.
+#
+#   * No root required.
+#   * No changes to the system trust store.
+#   * The current process tree is isolated: other software is unaffected.
+#
+# Why a bundle instead of the bare CA: SSL_CERT_FILE / REQUESTS_CA_BUNDLE /
+# CURL_CA_BUNDLE REPLACE the trusted roots for OpenSSL/Python/curl. Pointing
+# them at only our CA would break every HTTPS endpoint signed by a public CA
+# (npm, pypi, external APIs). The bundle keeps the public roots AND adds ours.
+# NODE_EXTRA_CA_CERTS instead APPENDS, so it gets the bare CA only.
+#
+# Usage:
+#   source ./scripts/proxy-env
+#   AI_PROXY_HOST=your-proxy.example.com source ./scripts/proxy-env
+#
+# Overrides (env):
+#   AI_PROXY_HOST            default: localhost
+#   AI_PROXY_PORT            default: 8443
+#   AI_PROXY_CA_FILE         default: $HOME/ai-proxy-ca.pem
+#   AI_PROXY_CA_FINGERPRINT  optional sha256 (colon form) to pin
+#   AI_PROXY_NODE_OPENSSL    set to 0 to skip --use-openssl-ca
+#
+# NOTE: designed to be sourced (sets exports in the caller). Returns non-zero
+# on failure instead of exiting, so a sourcing shell is not killed.
+
+# Idempotency: skip if already loaded (unless forced).
+if [ -n "${AI_PROXY_ENV_LOADED:-}" ] && [ "${AI_PROXY_FORCE:-0}" != "1" ]; then
+  return 0 2>/dev/null || true
+fi
+
+# Per-user config written by the user-space installer
+# (curl .../install-user.sh | bash). Sourced only when the caller has not set
+# AI_PROXY_HOST explicitly, so an explicit env always wins.
+if [ -z "${AI_PROXY_HOST:-}" ] && [ -f "$HOME/.config/ai-proxy/env.conf" ]; then
+  . "$HOME/.config/ai-proxy/env.conf"
+fi
+
+AI_PROXY_HOST="${AI_PROXY_HOST:-localhost}"
+AI_PROXY_PORT="${AI_PROXY_PORT:-8443}"
+AI_PROXY_CA_FILE="${AI_PROXY_CA_FILE:-$HOME/ai-proxy-ca.pem}"
+CA_URL="http://${AI_PROXY_HOST}:${AI_PROXY_PORT}/ca.pem"
+
+_proxy_env_fail() { echo "proxy-env: $*" >&2; return 1 2>/dev/null || exit 1; }
+
+# 1. Ensure the CA is present locally.
+if [ ! -f "$AI_PROXY_CA_FILE" ]; then
+  if ! command -v curl >/dev/null 2>&1; then
+    _proxy_env_fail "curl not found and CA missing at $AI_PROXY_CA_FILE"
+  fi
+  if ! curl -fsS "$CA_URL" -o "$AI_PROXY_CA_FILE"; then
+    _proxy_env_fail "failed to download CA from $CA_URL"
+  fi
+fi
+
+# 2. Validate the certificate and optionally pin the fingerprint.
+if command -v openssl >/dev/null 2>&1; then
+  if ! openssl x509 -noout -in "$AI_PROXY_CA_FILE" >/dev/null 2>&1; then
+    _proxy_env_fail "not a valid X.509 certificate: $AI_PROXY_CA_FILE"
+  fi
+  if [ -n "${AI_PROXY_CA_FINGERPRINT:-}" ]; then
+    _fp="$(openssl x509 -fingerprint -sha256 -noout -in "$AI_PROXY_CA_FILE" | cut -d= -f2-)"
+    if [ "${_fp:-}" != "$AI_PROXY_CA_FINGERPRINT" ]; then
+      echo "proxy-env: CA fingerprint mismatch" >&2
+      echo "  expected: $AI_PROXY_CA_FINGERPRINT" >&2
+      echo "  actual:   ${_fp:-<none>}" >&2
+      return 1 2>/dev/null || exit 1
+    fi
+  fi
+fi
+
+# 3. Build the bundle = system roots + our CA. Detect the system bundle path
+#    across distros (Debian/Arch/Alpine, RHEL/Fedora, macOS).
+_SYS_CA=""
+for _c in \
+  /etc/ssl/certs/ca-certificates.crt \
+  /etc/pki/tls/certs/ca-bundle.crt \
+  /etc/ssl/cert.pem \
+  /etc/ssl/certs/ca-bundle.crt
+do
+  if [ -f "$_c" ]; then _SYS_CA="$_c"; break; fi
+done
+
+_CACHE_DIR="$HOME/.cache/ai-proxy"
+BUNDLE="$_CACHE_DIR/ca-bundle.crt"
+mkdir -p "$_CACHE_DIR"
+
+if [ -z "$_SYS_CA" ]; then
+  # No system bundle detected: fall back to the bare CA.
+  cp "$AI_PROXY_CA_FILE" "$BUNDLE"
+else
+  # system roots + our CA, then dedup identical PEM blocks by sha256(DER).
+  _blocks="$_CACHE_DIR/.blocks"
+  rm -rf "$_blocks"; mkdir -p "$_blocks"
+  cat "$_SYS_CA" "$AI_PROXY_CA_FILE" | \
+    awk -v d="$_blocks" '/BEGIN CERTIFICATE/{n++; f=d"/"n".pem"} f != ""{print > f}'
+  : > "$BUNDLE"
+  _seen=""
+  for _p in "$_blocks"/*.pem; do
+    [ -f "$_p" ] || continue
+    _h="$(openssl x509 -fingerprint -sha256 -noout -in "$_p" 2>/dev/null | cut -d= -f2-)"
+    case " $_seen " in
+      *" $_h "*) ;;                          # identical block already present
+      *) _seen="$_seen $_h"; cat "$_p" >> "$BUNDLE" ;;
+    esac
+  done
+  rm -rf "$_blocks"
+fi
+
+# 4. Export per-process environment.
+export AI_PROXY_HOST AI_PROXY_PORT AI_PROXY_CA_FILE
+export HTTPS_PROXY="http://${AI_PROXY_HOST}:${AI_PROXY_PORT}"
+export HTTP_PROXY="http://${AI_PROXY_HOST}:${AI_PROXY_PORT}"
+export NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+# Replacing-roots tools -> the bundle.
+export SSL_CERT_FILE="$BUNDLE"
+export REQUESTS_CA_BUNDLE="$BUNDLE"
+export CURL_CA_BUNDLE="$BUNDLE"
+export GIT_SSL_CAINFO="$BUNDLE"
+export SSL_CERT_DIR="/etc/ssl/certs"
+# Appending tool -> the bare CA only.
+export NODE_EXTRA_CA_CERTS="$AI_PROXY_CA_FILE"
+# Node's global fetch()/undici ignores NODE_EXTRA_CA_CERTS. --use-openssl-ca
+# makes the TLS layer honour the OpenSSL store + NODE_EXTRA_CA_CERTS.
+if [ "${AI_PROXY_NODE_OPENSSL:-1}" != "0" ]; then
+  case "${NODE_OPTIONS:-}" in
+    *use-openssl-ca*) ;;
+    *) NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--use-openssl-ca"; export NODE_OPTIONS ;;
+  esac
+fi
+export AI_PROXY_ENV_LOADED=1
+
+echo "proxy-env: proxy=${HTTPS_PROXY} ca=${AI_PROXY_CA_FILE##*/} bundle=${BUNDLE}"

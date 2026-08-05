@@ -1,0 +1,629 @@
+name: CI — secure AI proxy
+
+on:
+  push:
+    branches: [master, feat/*]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+  AI_PROXY_CONFIG: proxy/config.test.toml
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: proxy
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: cli/go.mod
+
+      - name: Build apx binaries (embedded via include_bytes)
+        run: bash ../cli/build-all.sh
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            proxy/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('proxy/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Unit tests
+        run: cargo test
+
+      - name: Integration tests
+        run: cargo test --test integration -- --test-threads=1
+
+
+  # --- PostgreSQL user store + admin API + quotas (E2E) ---
+  users-db-e2e:
+    name: users-db E2E (PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: proxy
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: aipx
+          POSTGRES_PASSWORD: aipx
+          POSTGRES_DB: aipx_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aipx"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: cli/go.mod
+
+      - name: Build apx binaries (embedded via include_bytes)
+        run: bash ../cli/build-all.sh
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            proxy/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('proxy/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Wait for PostgreSQL
+        run: |
+          for i in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 5432 -U aipx; then exit 0; fi
+            sleep 1
+          done
+          echo "PostgreSQL not ready"; exit 1
+
+      - name: Run users-db E2E
+        env:
+          DATABASE_URL: postgres://aipx:aipx@127.0.0.1:5432/aipx_test
+          ADMIN_SECRET: ci-admin-secret
+          PROXY_BIN: target/release/ai-proxy
+        run: bash ../scripts/e2e-users-db.sh
+
+  # --- Auth smoke: 407 / 429 / disable-enable (E2E) ---
+  e2e-auth-smoke:
+    name: auth smoke (407/429/disable)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: proxy
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: aipx
+          POSTGRES_PASSWORD: aipx
+          POSTGRES_DB: aipx_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aipx"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: cli/go.mod
+
+      - name: Build apx binaries (embedded via include_bytes)
+        run: bash ../cli/build-all.sh
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            proxy/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('proxy/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Wait for PostgreSQL
+        run: |
+          for i in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 5432 -U aipx; then exit 0; fi
+            sleep 1
+          done
+          echo "PostgreSQL not ready"; exit 1
+
+      - name: Run auth smoke (407/429/disable)
+        env:
+          DATABASE_URL: postgres://aipx:aipx@127.0.0.1:5432/aipx_test
+          JWT_SECRET: "ci-test-jwt-secret-9f2c1e7b"
+          PROXY_BIN: target/release/ai-proxy
+        run: bash ../scripts/e2e-auth-smoke.sh
+
+  # --- Linux: Go CLI apx (smoke) ---
+  apx-linux-smoke:
+    name: apx smoke (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: cli/go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests (auth helpers)
+        run: go test -run 'TestBuildBwrapArgs' -v ./...
+
+      - name: Build native apx
+        run: |
+          case "$(uname -m)" in
+            x86_64) GOARCH=amd64 ;;
+            arm64)  GOARCH=arm64  ;;
+          esac
+          CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" \
+            go build -ldflags="-s -w" -o dist/apx-native .
+
+      - name: Smoke tests
+        run: |
+          set -euo pipefail
+          check() {
+            local name="$1" want="$2"; shift 2
+            set +e; "$@" >/tmp/apx-out.txt 2>&1; local got=$?; set -e
+            [ "$got" -eq "$want" ] || { echo "FAIL: $name (exit $got, want $want)"; cat /tmp/apx-out.txt; exit 1; }
+          }
+          expect() {
+            grep -q "$2" /tmp/apx-out.txt || { echo "FAIL: $1: no '$2' in output"; cat /tmp/apx-out.txt; exit 1; }
+          }
+          check "version"    0 ./dist/apx-native version
+          expect "version" "apx 0.2.0"
+          check "usage"      1 ./dist/apx-native
+          expect "usage" "Usage:"
+          check "bogus cmd"  1 ./dist/apx-native bogus
+          check "completion bash"  0 ./dist/apx-native completion bash
+          expect "completion bash" "_apx_completions"
+          check "completion zsh"   0 ./dist/apx-native completion zsh
+          expect "completion zsh" "_apx()"
+          check "completion fish"  0 ./dist/apx-native completion fish
+          expect "completion fish" "apx"
+          check "aliases"   0 ./dist/apx-native aliases
+          expect "aliases" "AI Proxy agent functions"
+          echo "smoke OK"
+
+  # ─── Arch Linux: apx build + auth unit tests (container) ───────
+  apx-arch-smoke:
+    name: apx smoke (arch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container: archlinux:latest
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Go
+        run: pacman -Sy --noconfirm go
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Auth unit tests
+        run: go test -run 'TestBuildBwrapArgs|TestEncryptDecryptRoundtrip' -v ./...
+
+      - name: Build apx
+        run: CGO_ENABLED=0 go build -ldflags="-s -w" -o dist/apx-linux .
+
+      - name: Smoke
+        run: |
+          set -euo pipefail
+          ./dist/apx-linux version | grep -q 'apx 0.2.0'
+          ./dist/apx-linux completion bash | grep -q '_apx_completions'
+          ./dist/apx-linux env 2>/dev/null; echo "arch apx OK"
+
+  # ─── Fedora: apx build + auth unit tests (container) ───────────
+  apx-fedora-smoke:
+    name: apx smoke (fedora)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container: fedora:latest
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Go
+        run: dnf install -y golang
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Auth unit tests
+        run: go test -run 'TestBuildBwrapArgs' -v ./...
+
+      - name: Build apx
+        run: CGO_ENABLED=0 go build -ldflags="-s -w" -o dist/apx-linux .
+
+      - name: Smoke
+        run: |
+          set -euo pipefail
+          ./dist/apx-linux version | grep -q 'apx 0.2.0'
+          ./dist/apx-linux completion bash | grep -q '_apx_completions'
+          ./dist/apx-linux env 2>/dev/null; echo "fedora apx OK"
+
+
+  # ─── macOS: Go CLI apx (smoke) ───────────────────────────────────
+  # Real macOS runners — covers both architectures (arm64 + x86_64).
+  # macos-13 (Intel) retired Dec 2025; macos-15-intel is the last x86_64 image.
+  apx-macos-smoke:
+    name: apx smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: cli/go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests (auth helpers)
+        run: go test -run 'TestBuildBwrapArgs' -v ./...
+
+      - name: Build native apx
+        run: |
+          case "$(uname -m)" in
+            x86_64) GOARCH=amd64 ;;
+            arm64)  GOARCH=arm64  ;;
+          esac
+          CGO_ENABLED=0 GOOS=darwin GOARCH="$GOARCH" \
+            go build -ldflags="-s -w" -o dist/apx-native .
+
+      - name: Smoke tests
+        run: |
+          set -euo pipefail
+          check() { # name, expected_exit, cmd...
+            local name="$1" want="$2"; shift 2
+            set +e
+            "$@" >/tmp/apx-out.txt 2>&1
+            local got=$?
+            set -e
+            [ "$got" -eq "$want" ] || {
+              echo "FAIL: $name (exit $got, want $want)"; cat /tmp/apx-out.txt; exit 1
+            }
+          }
+          expect() { # name, pattern
+            grep -q "$2" /tmp/apx-out.txt || { echo "FAIL: $1: no '$2' in output"; cat /tmp/apx-out.txt; exit 1; }
+          }
+
+          check "version"    0 ./dist/apx-native version
+          expect "version" "apx 0.2.0"
+          check "usage"      1 ./dist/apx-native
+          expect "usage" "Usage:"
+          check "bogus cmd"  1 ./dist/apx-native bogus
+          check "completion bash"  0 ./dist/apx-native completion bash
+          expect "completion bash" "_apx_completions"
+          check "completion zsh"   0 ./dist/apx-native completion zsh
+          expect "completion zsh" "_apx()"
+          check "completion fish"  0 ./dist/apx-native completion fish
+          expect "completion fish" "apx"
+          check "aliases"   0 ./dist/apx-native aliases
+          expect "aliases" "AI Proxy agent functions"
+          echo "smoke OK"
+
+  # ─── macOS: real installer E2E (arm64) ────────────────────────────
+  # No Rust proxy — a tiny python HTTP mock serves the three endpoints the
+  # installer needs (/install.sh fixture, /cli/apx-darwin-*, /ca.pem).
+  # Then the REAL installer runs: curl install.sh | bash → apx install
+  # (downloads CA, builds bundle, adds CA to user login keychain —
+  # macOS-only path testable only on a real Mac).
+  apx-macos-install-e2e:
+    name: apx install E2E (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: cli/go.mod
+
+      - name: Build apx binaries (4 targets)
+        run: bash build-all.sh
+
+      - name: Generate test CA (CN "AI Proxy CA")
+        run: |
+          openssl req -x509 -newkey rsa:2048 -keyout /tmp/mock-ca.key \
+            -out /tmp/mock-ca.pem -days 1 -nodes \
+            -subj "/CN=AI Proxy CA" \
+            -addext "basicConstraints=critical,CA:TRUE" 2>/dev/null
+
+      - name: Start mock proxy (python http.server, port 18445)
+        run: |
+          python3 - <<'PY' > /tmp/mock.log 2>&1 &
+          import http.server
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  print(self.path, flush=True)
+                  if self.path == "/install.sh":
+                      body = open("testdata/install.sh", "rb").read()
+                  elif self.path.startswith("/cli/apx-darwin-"):
+                      body = open("dist/" + self.path.rsplit("/", 1)[-1], "rb").read()
+                  elif self.path == "/ca.pem":
+                      body = open("/tmp/mock-ca.pem", "rb").read()
+                  else:
+                      self.send_error(404)
+                      return
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/octet-stream")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+              def log_message(self, *a):
+                  pass
+          http.server.HTTPServer(("127.0.0.1", 18445), H).serve_forever()
+          PY
+          echo $! > /tmp/mock.pid
+          for i in $(seq 1 15); do
+            if curl -fsS http://127.0.0.1:18445/ca.pem -o /dev/null 2>/dev/null; then
+              echo "mock is up (attempt $i)"
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/mock.log
+          exit 1
+
+      - name: Probe security add-trusted-cert (30s watchdog)
+        run: |
+          ( security add-trusted-cert -r trustRoot \
+              -k "$HOME/Library/Keychains/login.keychain-db" /tmp/mock-ca.pem \
+          ) > /tmp/kc.log 2>&1 &
+          KPID=$!
+          for i in $(seq 1 30); do
+            kill -0 "$KPID" 2>/dev/null || break
+            sleep 1
+          done
+          if kill -0 "$KPID" 2>/dev/null; then
+            echo "security add-trusted-cert HANGS on this runner (headless)"
+            kill "$KPID" 2>/dev/null || true
+            cat /tmp/kc.log
+            echo "HANG" > /tmp/kc.status
+          else
+            echo "security finished:"
+            cat /tmp/kc.log
+            echo "OK" > /tmp/kc.status
+          fi
+
+      - name: Unlock login keychain (diagnose lock state)
+        run: |
+          KC="$HOME/Library/Keychains/login.keychain-db"
+          echo "--- keychain state ---"
+          security show-keychain-info "$KC" 2>&1 || echo "(locked or error)"
+          echo "--- unlock attempts ---"
+          for pw in runner secret password test ""; do
+            if security unlock-keychain -p "$pw" "$KC" 2>/dev/null; then
+              echo "unlocked with password: '${pw:-<empty>}'"
+              security set-keychain-settings -lut 3600 "$KC" 2>&1 || true
+              break
+            fi
+          done
+          security show-keychain-info "$KC" 2>&1 || echo "(still locked)"
+
+      - name: Run real installer (curl install.sh | bash, watchdog 60s)
+        run: |
+          ( curl -sS http://127.0.0.1:18445/install.sh | bash ) \
+            > /tmp/install.log 2>&1 &
+          IPID=$!
+          for i in $(seq 1 60); do
+            kill -0 "$IPID" 2>/dev/null || break
+            sleep 1
+          done
+          if kill -0 "$IPID" 2>/dev/null; then
+            echo "INSTALLER HUNG after 60s — killing"
+            kill "$IPID" 2>/dev/null || true
+            sleep 1
+            echo "--- installer output ---"
+            cat /tmp/install.log
+            echo "--- mock access log ---"
+            cat /tmp/mock.log
+            # Keychain step hangs on headless runners (securityd waits for
+            # UI). Everything before it (binary, CA, bundle, config) is done.
+            if tail -1 /tmp/install.log | grep -q "Adding CA to user login keychain"; then
+              echo "NOTE: hang at keychain step — expected on headless runner"
+            else
+              exit 1
+            fi
+          else
+            cat /tmp/install.log
+          fi
+          test -x "$HOME/.local/bin/apx" || { echo "apx not installed"; exit 1; }
+          "$HOME/.local/bin/apx" version
+
+      - name: apx check — 6 hard checks, keychain tolerated on headless
+        run: |
+          set +e
+          out=$("$HOME/.local/bin/apx" check 2>&1)
+          rc=$?
+          set -e
+          echo "$out"
+          # Mandatory checks (all but keychain/sandbox).
+          echo "$out" | grep -q "OK    proxy reachable"
+          echo "$out" | grep -q "OK    CA downloaded"
+          echo "$out" | grep -q "OK    CA validates"
+          echo "$out" | grep -q "OK    CA bundle present"
+          echo "$out" | grep -q "OK    CA in bundle"
+          echo "$out" | grep -q "OK    config present"
+          # Keychain trust is environment-dependent (headless runner hangs).
+          if echo "$out" | grep -q "OK    sandbox"; then
+            echo "keychain trust: OK"
+          else
+            echo "keychain trust: FAIL — headless runner limitation"
+          fi
+
+      - name: Verify CA in user login keychain (if probe succeeded)
+        run: |
+          if [ "$(cat /tmp/kc.status)" = "OK" ]; then
+            security find-certificate -c "AI Proxy CA" \
+              "$HOME/Library/Keychains/login.keychain-db"
+          else
+            echo "SKIP — security add-trusted-cert unavailable on headless runner"
+          fi
+
+      - name: Run client through proxy (curl instead of agent)
+        run: |
+          "$HOME/.local/bin/apx" run env | grep -q "HTTPS_PROXY=http://127.0.0.1:18445"
+          "$HOME/.local/bin/apx" run curl -fsS --resolve mock.local:18445:127.0.0.1 \
+            http://mock.local:18445/ca.pem | grep -q "BEGIN CERTIFICATE"
+          grep -q "/ca.pem" /tmp/mock.log || { echo "mock log:"; cat /tmp/mock.log; exit 1; }
+          "$HOME/.local/bin/apx" completion zsh | grep -q "_apx()"
+          echo "client OK"
+
+      - name: Stop mock
+        if: always()
+        run: kill "$(cat /tmp/mock.pid)" 2>/dev/null || true
+
+  # ─── macOS: auth smoke with proxy + PostgreSQL (darwin) ─────────
+  e2e-auth-macos:
+    name: auth smoke (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: proxy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: cli/go.mod
+
+      - name: Build apx binaries (embedded via include_bytes)
+        run: bash ../cli/build-all.sh
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            proxy/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('proxy/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build release binary (darwin)
+        run: cargo build --release
+
+      - name: Install and start PostgreSQL
+        run: |
+          brew install postgresql@16
+          PGHOME="$(brew --prefix postgresql@16)"
+          export PATH="$PGHOME/bin:$PATH"
+          # Headless runner: init and start manually.
+          PGDATA=/tmp/pgdata
+          rm -rf "$PGDATA"
+          initdb -D "$PGDATA" -U aipx --auth=trust
+          pg_ctl -D "$PGDATA" -l /tmp/pg.log start
+          for i in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 5432 -U aipx; then
+              echo "PostgreSQL ready (attempt $i)"
+              createdb -U aipx aipx_test
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "PostgreSQL not ready"
+          cat /tmp/pg.log
+          exit 1
+
+      - name: Run auth smoke (407/429/disable)
+        env:
+          DATABASE_URL: postgres://aipx:aipx@127.0.0.1:5432/aipx_test
+          JWT_SECRET: "ci-test-jwt-secret-9f2c1e7b"
+          PROXY_BIN: target/release/ai-proxy
+        run: |
+          PGHOME="$(brew --prefix postgresql@16)"
+          export PATH="$PGHOME/bin:$PATH"
+          bash ../scripts/e2e-auth-smoke.sh

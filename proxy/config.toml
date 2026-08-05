@@ -1,0 +1,39 @@
+# AI Proxy — MITM mode configuration
+# Set HTTPS_PROXY=http://localhost:8443 to route traffic through the proxy.
+
+mode = "mitm"
+
+[server]
+host = "0.0.0.0"
+port = 8443
+# ca_dir = "certs"   # Default: "certs/" relative to this config file.
+                     # CA cert is NEVER regenerated if it exists here.
+
+# ─── Target AI services (only these domains are proxied with DPI) ───
+
+[[targets]]
+host = "api.deepseek.com"
+port = 443
+
+[[targets]]
+host = "api.openai.com"
+port = 443
+
+[[targets]]
+host = "httpbin.org"
+port = 80
+tls = false
+
+# ─── Authentication ──────────────────────────────
+
+[auth]
+backend = "file"
+realm = "AI Proxy"
+require_auth = false   # set to true to require Proxy-Authorization
+
+[auth.file]
+[[auth.file.users]]
+username = "testuser"
+pw = "CHANGE_ME:see_apx_hash-password"
+user_id = "testuser"
+# To generate password hashes: apx hash-password username password

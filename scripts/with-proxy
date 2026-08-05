@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# with-proxy — run a single command through AI Proxy with isolated env.
+#
+# Loads ./proxy-env (CA + bundle + proxy vars) for THIS process only, then execs
+# the command. The system trust store is never touched; no root needed.
+#
+# Best for Node.js / Python agents that honour env-based CA injection:
+#   claude, pi, opencode, gemini, cline, aider, httpx/requests scripts.
+# For runtimes that read ONLY the system store (Codex/reqwest, Cursor/Electron)
+# use ./proxy-shell (bubblewrap) instead.
+#
+# Usage:
+#   with-proxy claude
+#   with-proxy pi
+#   with-proxy aider --model deepseek/deepseek-chat
+#   with-proxy curl https://api.deepseek.com/v1/models
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ "$#" -eq 0 ]; then
+  cat >&2 <<EOF
+usage: with-proxy <command> [args...]
+  with-proxy claude
+  with-proxy aider --model deepseek/deepseek-chat
+  with-proxy curl https://api.deepseek.com/v1/models
+EOF
+  exit 64
+fi
+
+# shellcheck source=proxy-env
+. "$SCRIPT_DIR/proxy-env"
+
+exec "$@"

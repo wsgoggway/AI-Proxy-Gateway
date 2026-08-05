@@ -1,0 +1,157 @@
+mode = "mitm"
+
+[server]
+host = "0.0.0.0"
+port = {{ proxy_port | default(8443) }}
+
+# ─── Redis (required for vault — reversible ‹KEY_xxx› mapping) ───
+# Ensure Redis is configured with persistence:
+#   redis-cli CONFIG SET appendonly yes
+#   redis-cli CONFIG SET save "900 1 300 10 60 10000"
+[redis]
+url = "redis://:{{ redis_pass | default('') }}@{{ redis_host | default('127.0.0.1') }}:{{ redis_port | default(6379) }}"
+
+# ─── Auth: database backend (required for users/audit/billing) ───
+# Ensure PostgreSQL backups are configured:
+#   pg_dump ai_proxy | gzip > /backup/ai_proxy_$(date +%Y%m%d).sql.gz
+[auth]
+backend = "db"
+require_auth = true
+
+[auth.db]
+url = "postgres://{{ db_user | default('ai_proxy') }}:{{ db_pass | default('changeme') }}@{{ db_host | default('127.0.0.1') }}:{{ db_port | default(5432) }}/{{ db_name | default('ai_proxy') }}"
+
+[auth.jwt]
+secret = "{{ jwt_secret | default('change-me-in-production') }}"
+token_ttl_days = 30
+
+[auth.admin]
+bind = "0.0.0.0:{{ admin_port | default(8444) }}"
+
+[[targets]]
+host = "api.deepseek.com"
+port = 443
+
+[[targets]]
+host = "api.openai.com"
+port = 443
+
+[[targets]]
+host = "api.anthropic.com"
+port = 443
+
+[[targets]]
+host = "generativelanguage.googleapis.com"
+port = 443
+
+[[targets]]
+host = "dashscope.aliyuncs.com"
+port = 443
+
+[[targets]]
+host = "api.mistral.ai"
+port = 443
+
+[[targets]]
+host = "api.groq.com"
+port = 443
+
+[[targets]]
+host = "api.x.ai"
+port = 443
+
+[[targets]]
+host = "api.z.ai"
+port = 443
+
+[[targets]]
+host = "zenmux.ai"
+port = 443
+
+[[targets]]
+host = "api.perplexity.ai"
+port = 443
+
+[[targets]]
+host = "api.cohere.ai"
+port = 443
+
+[[targets]]
+host = "api.together.xyz"
+port = 443
+
+[[targets]]
+host = "api.fireworks.ai"
+port = 443
+
+[[targets]]
+host = "openrouter.ai"
+port = 443
+
+[[targets]]
+host = "api.siliconflow.com"
+port = 443
+
+[[targets]]
+host = "api.moonshot.cn"
+port = 443
+
+[[targets]]
+host = "api.minimax.chat"
+port = 443
+
+[[targets]]
+host = "open.bigmodel.cn"
+port = 443
+
+[[targets]]
+host = "api.novita.ai"
+port = 443
+
+[[targets]]
+host = "api.stability.ai"
+port = 443
+
+[[targets]]
+host = "api.replicate.com"
+port = 443
+
+[[targets]]
+host = "inference.huggingface.co"
+port = 443
+
+[[targets]]
+host = "api.jina.ai"
+port = 443
+
+[[targets]]
+host = "api.stepfun.com"
+port = 443
+
+[[targets]]
+host = "api.01.ai"
+port = 443
+
+[[targets]]
+host = "api.lambdalabs.com"
+port = 443
+
+[[targets]]
+host = "api.runwayml.com"
+port = 443
+
+
+# ─── Semantic validation (LLM-based false-positive filter) ───
+# Requires Ollama running on localhost:11434 with qwen2.5:0.5b model.
+# When enabled, DPI detections are validated by a local LLM before tokenization.
+# False positives (code identifiers, documentation) are dropped.
+# Fail-open: if Ollama is down, all detections are kept (safe default).
+[semantic]
+enabled = true
+endpoint = "http://localhost:11434"
+model = "qwen2.5:0.5b"
+timeout_ms = 8000
+concurrency = 2
+cache_size = 1000
+circuit_breaker_failures = 5
+circuit_breaker_cooldown_sec = 300
