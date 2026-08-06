@@ -53,7 +53,7 @@ func Init() {
 	Cfg.CfgDir = cfgDir
 	Cfg.CacheDir = filepath.Join(Home(), ".cache", "ai-proxy")
 	Cfg.BinDir = filepath.Join(Home(), ".local", "bin")
-	Cfg.CAFile = filepath.Join(Home(), "ai-proxy-ca.pem")
+	Cfg.CAFile = filepath.Join(cfgDir, "ca.pem")
 	Cfg.BundleFile = filepath.Join(Cfg.CacheDir, "ca-bundle.crt")
 	Cfg.EnvConfig = filepath.Join(cfgDir, "env.conf")
 }

@@ -19,8 +19,19 @@ var installCmd = &cobra.Command{
 		fmt.Printf("  Proxy: %s:%s\n", internal.Cfg.ProxyHost, internal.Cfg.ProxyPort)
 
 		// 1. Download CA.
-		fmt.Printf("[1/3] Downloading CA...\n")
-		if err := internal.DownloadCA(); err != nil {
+		// Migrate legacy ~/ai-proxy-ca.pem into the config dir once.
+		legacyCA := filepath.Join(internal.Home(), "ai-proxy-ca.pem")
+		if internal.FileExists(legacyCA) && !internal.FileExists(internal.Cfg.CAFile) {
+			if err := os.MkdirAll(internal.Cfg.CfgDir, 0755); err != nil {
+				dieErr(fmt.Errorf("create config dir: %w", err))
+			}
+			if err := os.Rename(legacyCA, internal.Cfg.CAFile); err != nil {
+				dieErr(fmt.Errorf("migrate legacy CA: %w", err))
+			}
+			fmt.Printf("  %s %s\n", internal.Warn("⚠"), internal.Dim("migrated legacy CA to "+internal.Cfg.CAFile))
+		}
+		changed, err := internal.DownloadCAIfChanged()
+		if err != nil {
 			dieErr(fmt.Errorf("download CA: %w", err))
 		}
 		caData, err := os.ReadFile(internal.Cfg.CAFile)
@@ -31,8 +42,13 @@ var installCmd = &cobra.Command{
 		if err != nil {
 			dieErr(fmt.Errorf("invalid CA: %w", err))
 		}
-		fmt.Printf("  %s %s\n", internal.Success("✓"), internal.Dim("fingerprint: "+internal.CertFingerprint(cert)))
-		fmt.Printf("  %s %s\n", internal.Dim("saved:"), internal.Cfg.CAFile)
+		if !changed {
+			fmt.Printf("[1/3] CA up to date: %s\n", internal.CertFingerprint(cert))
+		} else {
+			fmt.Printf("[1/3] Downloading CA...\n")
+			fmt.Printf("  %s %s\n", internal.Success("✓"), internal.Dim("fingerprint: "+internal.CertFingerprint(cert)))
+			fmt.Printf("  %s %s\n", internal.Dim("saved:"), internal.Cfg.CAFile)
+		}
 
 		// 2. Build bundle.
 		fmt.Printf("[2/3] Building CA bundle...\n")

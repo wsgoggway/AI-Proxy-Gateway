@@ -62,7 +62,7 @@ apx run aider --model deepseek/deepseek-chat</code></pre>
 </div>
 
 <div class="note">
-  <strong>Авторизация (v0.2)</strong> — прокси поддерживает <code>Proxy-Authorization: Basic</code>.
+  <strong>Авторизация (v1.2)</strong> — прокси поддерживает <code>Proxy-Authorization: Basic</code>.
   Анонимный доступ отключён (407). Вход через <code>apx login</code>,
   который сохраняет креды в <code>~/.config/ai-proxy/env.conf</code> (chmod 600)
   и инжектит их в <code>HTTPS_PROXY=http://user:pass@host:port</code>.
@@ -142,6 +142,13 @@ pi                    # вместо apx run pi
 opencode              # вместо apx run opencode</code></pre>
 </div>
 
+<div class="step">
+  <span class="step-num">6</span>
+  <span class="step-title">Удаление (если что-то сломалось)</span>
+  <pre><code>apx uninstall          # удалить CA, конфиг, bundle
+apx uninstall --purge  # также удалить бинарник apx</code></pre>
+</div>
+
 <!-- ─── Agents ─── -->
 <h2>AI-агенты</h2>
 <div class="step">
@@ -166,6 +173,7 @@ opencode              # вместо apx run opencode</code></pre>
     <tr><td>tls handshake eof</td><td>CA не доверена: <code>apx install</code></td></tr>
     <tr><td>SSL-ошибка Python</td><td>bundle не собран: <code>apx install</code></td></tr>
     <tr><td>Codex не работает (Linux)</td><td>нужен bwrap: <code>apx run --sandbox codex</code></td></tr>
+    <tr><td>Всё сломалось</td><td>сброс: <code>apx uninstall &amp;&amp; apx install</code></td></tr>
   </table>
 </div>
 
@@ -183,7 +191,7 @@ opencode              # вместо apx run opencode</code></pre>
 </div>
 
 <div class="footer">
-  AI Proxy v0.2 — секреты токенизируются до того, как покинут сеть
+  AI Proxy v1.2.0 — секреты токенизируются до того, как покинут сеть
 </div>
 
 </div>

@@ -133,18 +133,18 @@ Rules:
 ### Tokenization mode (new, deterministic token)
 
 ```
-sk-1234567890abcdef -> ‹KEY_a3f2b1›   (SHA256(value + session_id)[:6])
-Иван Иванов         -> ‹FIO_9b2c7d›
-ООО Ромашка         -> ‹ORG_1c4e8a›
-user@company.com    -> ‹EML_d5f7b3›
-+7 999 123-45-67    -> ‹PHN_e8a1c5›
+sk-1234567890abcdef -> [KEY_a3f2b1]   (SHA256(value + session_id)[:6])
+Иван Иванов         -> [FIO_9b2c7d]
+ООО Ромашка         -> [ORG_1c4e8a]
+user@company.com    -> [EML_d5f7b3]
++7 999 123-45-67    -> [PHN_e8a1c5]
 ```
 
 Tokens are deterministic: same value + same session = always same token.
 This guarantees consistency — if a user sends `sk-abc` twice in one session,
-the AI sees `‹KEY_a3f2b1›` both times.
+the AI sees `[KEY_a3f2b1]` both times.
 
-Token format: `‹PREFIX_hash6›` where hash6 = first 6 chars of SHA256 hex.
+Token format: `[PREFIX_hash6]` where hash6 = first 6 chars of SHA256 hex.
 Prefix mapping:
 - KEY = Secret (API keys, tokens, passwords)
 - FIO = Full name

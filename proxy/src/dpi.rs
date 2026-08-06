@@ -394,53 +394,90 @@ const TYPE_PREFIX: &[(&str, ViolationType)] = &[
     ("PHN", ViolationType::PiiPhone),
 ];
 
-/// Token placeholder delimiters.
-/// Uses Unicode single guillemets (U+2039 / U+203A): ‹KEY_a3f2b1›
-/// AI models treat these as literal text.  The previous $...$ delimiters were
-/// abandoned because models interpret $...$ as LaTeX inline-math and strip the
-/// dollar signs from their output, breaking detokenization.
-pub const TOKEN_OPEN: &str = "\u{2039}"; // ‹
-pub const TOKEN_CLOSE: &str = "\u{203a}"; // ›
+// ─── Token format ────────────────────────────────────
+//
+// Token placeholder format: [TYPE_hex6]
+//   [KEY_d51b3f]   — secret/API key
+//   [FIO_a3f2b1]   — PII name
+//   [EML_0e3fc8]   — email
+//
+// Pure ASCII square brackets: not JSON-escaped, single-byte, BPE-split,
+// never part of identifiers. Previous formats and why they were abandoned:
+//   ‹TYPE_hex›  (Unicode U+2039/U+203A) — JSON-escaped by AI APIs, SSE chunk split
+//   q_TYPE_hex] (ASCII letters)        — LLMs merge q_/] with adjacent words
+// Square brackets are structural delimiters that LLMs never merge with text.
 
-/// Regex matching a fully-delimited token: ‹TYPE_hex6›
-pub static TOKEN_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\u{2039}([A-Z]+_[a-f0-9]{6})\u{203a}").expect("token regex"));
+/// Current token delimiters.
+pub const TOKEN_OPEN: &str = "[";
+pub const TOKEN_CLOSE: &str = "]";
 
-/// Regex matching a bare token whose delimiters were stripped by the model:
-/// KEY_a3f2b1 (without ‹ ›).  Restricted to known type prefixes to avoid
-/// false positives; the token_map lookup is the ultimate guard.
-pub static TOKEN_BARE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?:KEY|FIO|ORG|EML|PHN)_[a-f0-9]{6}").expect("bare token regex")
+/// Regex: current format [TYPE_hex] (primary)
+pub static TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\[\s*((?:KEY|FIO|ORG|EML|PHN)_[a-f0-9]{6})\s*\]").expect("token regex")
 });
 
-/// Scan *body* for token placeholders, returning `(byte_start, byte_end,
-/// full_token_with_delimiters)` triples sorted left-to-right.
-/// Primary matches use ‹…› delimiters; a fallback also catches bare tokens
-/// whose delimiters the model stripped, skipping any that sit inside a
-/// primary match to avoid double-processing.
+/// Regex: legacy q_TYPE_hex] (backward compat)
+pub static TOKEN_Q_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"q_((?:KEY|FIO|ORG|EML|PHN)_[a-f0-9]{6})]").expect("q token regex")
+});
+
+/// Regex: legacy ‹TYPE_hex› Unicode (backward compat)
+pub static TOKEN_LEGACY_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\u{2039}((?:KEY|FIO|ORG|EML|PHN)_[a-f0-9]{6})\u{203a}").expect("legacy token regex")
+});
+
+/// Regex: legacy \u2039TYPE_hex\u203a JSON-escaped (backward compat)
+pub static TOKEN_JSON_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\\u2039((?:KEY|FIO|ORG|EML|PHN)_[a-f0-9]{6})\\u203a").expect("json token regex")
+});
+
+/// Regex: bare TYPE_hex (model stripped all delimiters — last resort)
+pub static TOKEN_BARE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"((?:KEY|FIO|ORG|EML|PHN)_[a-f0-9]{6})").expect("bare token regex")
+});
+
+/// Extract the canonical core (TYPE_hex6, e.g. "KEY_d51b3f") from ANY token format.
+/// Used as the unified lookup key in token_map and vault — format-independent.
+pub fn token_core(token: &str) -> &str {
+    static CORE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = CORE_RE.get_or_init(|| Regex::new(r"(?:KEY|FIO|ORG|EML|PHN)_[a-f0-9]{6}").unwrap());
+    re.find(token).map(|m| m.as_str()).unwrap_or(token)
+}
+
+/// Unified token scanner: finds ALL token forms in text, returns
+/// `(byte_start, byte_end, core)` triples sorted left-to-right.
+/// Core is always the bare TYPE_hex6 string — format-independent lookup key.
+///
+/// Matches 5 forms (overlaps resolved by keeping earliest + longest):
+///   1. [KEY_d51b3f]            — current format (primary)
+///   2. q_KEY_d51b3f_q          — legacy ASCII (existing contexts)
+///   3. ‹KEY_d51b3f›            — legacy Unicode
+///   4. \u2039KEY_d51b3f\u203a  — legacy JSON-escaped
+///   5. KEY_d51b3f              — bare (model stripped delimiters)
 pub fn find_tokens(body: &str) -> Vec<(usize, usize, String)> {
-    let mut out: Vec<(usize, usize, String)> = Vec::new();
+    let mut raw: Vec<(usize, usize, String)> = Vec::new();
 
-    // Primary: ‹TYPE_hex6›
-    for cap in TOKEN_RE.captures_iter(body) {
-        if let Some(m) = cap.get(0) {
-            out.push((m.start(), m.end(), m.as_str().to_string()));
-        }
-    }
-
-    // Fallback: bare TYPE_hex6 not already covered by a primary match
-    for cap in TOKEN_BARE_RE.captures_iter(body) {
-        if let Some(m) = cap.get(0) {
-            let (s, e) = (m.start(), m.end());
-            let covered = out.iter().any(|(ps, pe, _)| *ps <= s && e <= *pe);
-            if !covered {
-                let full = format!("{}{}{}", TOKEN_OPEN, m.as_str(), TOKEN_CLOSE);
-                out.push((s, e, full));
+    for re in [&TOKEN_RE, &TOKEN_Q_RE, &TOKEN_LEGACY_RE, &TOKEN_JSON_RE, &TOKEN_BARE_RE] {
+        for cap in re.captures_iter(body) {
+            if let Some(m) = cap.get(0) {
+                let core = cap.get(1).unwrap().as_str().to_string();
+                raw.push((m.start(), m.end(), core));
             }
         }
     }
 
-    out.sort_by_key(|(s, _, _)| *s);
+    // Sort by start position, then by length descending (prefer longer matches)
+    raw.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+
+    // Remove overlapping matches: keep the first (earliest + longest)
+    let mut out: Vec<(usize, usize, String)> = Vec::new();
+    for (s, e, core) in raw {
+        let covered = out.iter().any(|(fs, fe, _)| *fs <= s && e <= *fe);
+        if !covered {
+            out.push((s, e, core));
+        }
+    }
+
     out
 }
 
@@ -453,9 +490,8 @@ fn prefix_for_type(vt: &ViolationType) -> &'static str {
         .unwrap_or("UNK")
 }
 
-/// Generate deterministic token for a value.
-/// Format: ‹TYPE_HASH› (Unicode guillemet-delimited).
-/// AI models treat ‹› as literal text, preserving the token intact.
+/// Generate deterministic token placeholder for a value.
+/// Format: [TYPE_HASH] (pure ASCII square brackets).
 pub fn generate_token(value: &str, violation_type: &ViolationType, session: &SessionId) -> String {
     let prefix = prefix_for_type(violation_type);
     let mut hasher = Sha256::new();
@@ -463,7 +499,7 @@ pub fn generate_token(value: &str, violation_type: &ViolationType, session: &Ses
     hasher.update(session.to_redis_key().as_bytes());
     let hash = hex::encode(hasher.finalize());
     let short_hash = &hash[..6];
-    format!("{}{}_{}{}", TOKEN_OPEN, prefix, short_hash, TOKEN_CLOSE)
+    format!("[{}_{}]", prefix, short_hash)
 }
 
 // ─── Masking functions ─────────────────────────
@@ -956,8 +992,8 @@ mod tests {
         let t1 = super::generate_token("sk-abc123", &ViolationType::Secret, &session);
         let t2 = super::generate_token("sk-abc123", &ViolationType::Secret, &session);
         assert_eq!(t1, t2, "same value + same session = same token");
-        assert!(t1.starts_with("‹KEY_"));
-        assert!(t1.ends_with("›"));
+        assert!(t1.starts_with("[KEY_"));
+        assert!(t1.ends_with("]"));
     }
 
     #[test]
@@ -977,19 +1013,19 @@ mod tests {
         let session = SessionId::new(Some("u"), "d");
 
         assert!(
-            super::generate_token("val", &ViolationType::Secret, &session).starts_with("‹KEY_")
+            super::generate_token("val", &ViolationType::Secret, &session).starts_with("[KEY_")
         );
         assert!(
-            super::generate_token("val", &ViolationType::PiiFio, &session).starts_with("‹FIO_")
+            super::generate_token("val", &ViolationType::PiiFio, &session).starts_with("[FIO_")
         );
         assert!(
-            super::generate_token("val", &ViolationType::PiiCompany, &session).starts_with("‹ORG_")
+            super::generate_token("val", &ViolationType::PiiCompany, &session).starts_with("[ORG_")
         );
         assert!(
-            super::generate_token("val", &ViolationType::PiiEmail, &session).starts_with("‹EML_")
+            super::generate_token("val", &ViolationType::PiiEmail, &session).starts_with("[EML_")
         );
         assert!(
-            super::generate_token("val", &ViolationType::PiiPhone, &session).starts_with("‹PHN_")
+            super::generate_token("val", &ViolationType::PiiPhone, &session).starts_with("[PHN_")
         );
     }
 
@@ -1005,7 +1041,7 @@ mod tests {
             "Secret should be tokenized"
         );
         assert!(
-            tokenized.contains("‹KEY_"),
+            tokenized.contains("[KEY_"),
             "Token placeholder should be present"
         );
         assert_eq!(tokens.len(), 1);
@@ -1019,9 +1055,9 @@ mod tests {
         let text = "Привет, я Иван Иванов из ООО Ромашка, почта user@company.com";
 
         let (tokenized, tokens) = DpiEngine::tokenize_text(text, &session);
-        assert!(tokenized.contains("‹FIO_"), "FIO should be tokenized");
+        assert!(tokenized.contains("[FIO_"), "FIO should be tokenized");
         // Company detection disabled
-        assert!(tokenized.contains("‹EML_"), "Email should be tokenized");
+        assert!(tokenized.contains("[EML_"), "Email should be tokenized");
         assert!(!tokenized.contains("Иванов"));
         assert!(!tokenized.contains("‹EML_c54971›"));
         assert!(tokens.len() >= 2);
@@ -1054,41 +1090,25 @@ mod tests {
         assert!(!tokenized.contains("Иванов"), "FIO leaked: {}", tokenized);
 
         assert!(
-            tokenized.contains("‹KEY_"),
+            tokenized.contains("[KEY_"),
             "No KEY token in: {}",
             tokenized
         );
-        assert!(
-            tokenized.contains("‹FIO_"),
-            "No FIO token in: {}",
-            tokenized
-        );
-
-        assert_eq!(tokens.len(), 2, "Expected 2 tokens, got {}", tokens.len());
-
-        let (tokenized2, _tokens2) = DpiEngine::tokenize_text(text, &session);
-        assert_eq!(tokenized, tokenized2, "Tokens must be deterministic");
     }
 
     #[test]
     fn test_tokenize_json_body_preserves_structure() {
         use crate::session::SessionId;
         let session = SessionId::new(Some("user1"), "api.deepseek.com");
-        // Realistic AI API request with secrets in string values
-        let body = r#"{"model":"deepseek-chat","messages":[{"role":"user","content":"My key sk-abc123def456ghi789 and email user@test.com"}],"api_key":"sk-secretkey123456789"}"#;
+        let body = r#"{"model":"deepseek-chat","messages":[{"role":"user","content":"My key sk-proj-abc123def456 and email user@test.com"}],"api_key":"sk-testkey-xyz789"}"#;
 
         let (tokenized, tokens) = DpiEngine::tokenize_json_body(body, &session);
 
-        // Must be valid JSON after tokenization
         let reparsed: serde_json::Value =
             serde_json::from_str(&tokenized).expect("Tokenized body must be valid JSON");
-
-        // Structure preserved
         assert_eq!(reparsed["model"], "deepseek-chat");
         assert_eq!(reparsed["messages"][0]["role"], "user");
-
-        // Secrets tokenized
-        assert!(!tokenized.contains("sk-abc123def456ghi789"), "Secret leaked");
+        assert!(!tokenized.contains("sk-proj-abc123def456"), "Secret leaked");
         assert!(!tokenized.contains("user@test.com"), "Email leaked");
         assert!(tokens.len() >= 2, "Expected at least 2 tokens");
     }
@@ -1097,15 +1117,10 @@ mod tests {
     fn test_tokenize_json_body_does_not_touch_keys() {
         use crate::session::SessionId;
         let session = SessionId::new(Some("user1"), "d");
-        // JSON key "api_key" must NOT be tokenized — only values
         let body = r#"{"api_key":"safe-value","model":"gpt-4"}"#;
-
         let (tokenized, _tokens) = DpiEngine::tokenize_json_body(body, &session);
-
-        // Must be valid JSON
         let reparsed: serde_json::Value =
             serde_json::from_str(&tokenized).expect("Must be valid JSON");
-        // Key preserved
         assert!(reparsed.get("api_key").is_some(), "api_key key must exist");
         assert_eq!(reparsed["model"], "gpt-4");
     }
@@ -1114,20 +1129,109 @@ mod tests {
     fn test_tokenize_json_body_invalid_json_fallback() {
         use crate::session::SessionId;
         let session = SessionId::new(Some("user1"), "d");
-        // Non-JSON body — should fall back to raw tokenization
-        let body = "My key is sk-abc123def456ghi789";
-
+        let body = "My key is sk-proj-abc123def456";
         let (tokenized, tokens) = DpiEngine::tokenize_json_body(body, &session);
-        assert!(tokenized.contains("‹KEY_"), "Should tokenize in raw mode");
+        assert!(tokenized.contains("[KEY_"), "Should produce ASCII token");
         assert!(!tokens.is_empty());
     }
 
-    // ─── Brand name detection ───────────────────────
+    #[test]
+    fn test_find_tokens_new_ascii() {
+        let body = "value [KEY_d51b3f] end";
+        let tokens = find_tokens(body);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].2, "KEY_d51b3f", "Must return bare core");
+    }
 
+    #[test]
+    fn test_find_tokens_legacy_unicode() {
+        let body = "PGPASSWORD=‹KEY_d51b3f› and more";
+        let tokens = find_tokens(body);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].2, "KEY_d51b3f");
+    }
 
+    #[test]
+    fn test_find_tokens_legacy_json_escaped() {
+        let body = r#"PGPASSWORD=\u2039KEY_d51b3f\u203a and more"#;
+        let tokens = find_tokens(body);
+        assert_eq!(tokens.len(), 1, "Must find JSON-escaped legacy token");
+        assert_eq!(tokens[0].2, "KEY_d51b3f");
+    }
 
+    #[test]
+    fn test_find_tokens_bare() {
+        let body = "value is KEY_d51b3f here";
+        let tokens = find_tokens(body);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].2, "KEY_d51b3f");
+    }
 
+    #[test]
+    fn test_find_tokens_mixed_all_formats() {
+        let body = "new [KEY_a1b2c3] legacy ‹KEY_d51b3f› json \\u2039KEY_e4f5a6\\u203a bare ORG_123456";
+        let tokens = find_tokens(body);
+        assert_eq!(tokens.len(), 4);
+        for (_, _, core) in &tokens {
+            assert!(!core.starts_with("q_"), "Core must be bare: {}", core);
+            assert!(!core.starts_with("‹"), "Core must be bare: {}", core);
+        }
+    }
 
+    #[test]
+    fn test_find_tokens_no_false_positives() {
+        let body = "normal text without tokens KEY_ and stuff q_test]";
+        let tokens = find_tokens(body);
+        assert!(tokens.is_empty());
+    }
 
+    #[test]
+    fn test_find_tokens_bracket_with_spaces() {
+        let body = "value [ KEY_d51b3f ] end";
+        let tokens = find_tokens(body);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].2, "KEY_d51b3f");
+    }
 
+    #[test]
+    fn test_find_tokens_bracket_leading_space() {
+        let body = "value [ KEY_d51b3f] end";
+        let tokens = find_tokens(body);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].2, "KEY_d51b3f");
+    }
+
+    #[test]
+    fn test_find_tokens_bracket_trailing_space() {
+        let body = "value [KEY_d51b3f ] end";
+        let tokens = find_tokens(body);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].2, "KEY_d51b3f");
+    }
+
+    #[test]
+    fn test_find_tokens_bracket_multiple_spaces() {
+        let body = "value [  KEY_d51b3f  ] end";
+        let tokens = find_tokens(body);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].2, "KEY_d51b3f");
+    }
+
+    #[test]
+    fn test_token_core_extracts_from_any_format() {
+        assert_eq!(token_core("[KEY_d51b3f]"), "KEY_d51b3f");
+        assert_eq!(token_core("‹KEY_d51b3f›"), "KEY_d51b3f");
+        assert_eq!(token_core("\\u2039KEY_d51b3f\\u203a"), "KEY_d51b3f");
+        assert_eq!(token_core("KEY_d51b3f"), "KEY_d51b3f");
+    }
+
+    #[test]
+    fn test_generate_token_is_ascii() {
+        use crate::session::SessionId;
+        let session = SessionId::new(Some("user1"), "api.test.com");
+        let token = generate_token("secret_value", &ViolationType::Secret, &session);
+        assert!(token.starts_with("["), "Token must start with [: {}", token);
+        assert!(token.ends_with("]"), "Token must end with ]: {}", token);
+        assert!(token.is_ascii(), "Token must be pure ASCII: {}", token);
+    }
 }

@@ -26,9 +26,10 @@ pub fn init(cfg: &crate::config::Config) {
     let _ = SEMANTIC.set(checker);
 }
 
-/// Borrow the global SemanticChecker (if initialised and enabled).
-pub fn get() -> Option<&'static SemanticChecker> {
-    SEMANTIC.get().and_then(|opt| opt.as_deref())
+/// Clone of the global SemanticChecker (if initialised and enabled).
+/// Returns an owned Arc for use in AppState.
+pub fn get() -> Option<std::sync::Arc<SemanticChecker>> {
+    SEMANTIC.get().and_then(|opt| opt.clone())
 }
 
 use lru::LruCache;

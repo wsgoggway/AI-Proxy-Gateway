@@ -17,6 +17,7 @@ use crate::config;
 use crate::forward;
 use crate::session::SessionId;
 use crate::vault::Vault;
+use crate::state::AppState;
 
 /// User-space CA wrappers shipped from the repo so the binary and the on-disk
 /// scripts cannot drift apart. Served verbatim at /scripts/<name>.
@@ -502,13 +503,7 @@ async fn handle_plain_http(
                     .unwrap())
             });
         }
-
         // Forward to target through DPI pipeline
-        let config = config.clone();
-        let upstream_connector = upstream_connector.clone();
-        let vault = vault.clone();
-        let audit_sender = audit_sender.clone();
-
         // Determine target host from absolute URL or Host header
         let host = if let Some(host_str) = req.uri().host() {
             host_str.to_string()
@@ -522,28 +517,26 @@ async fn handle_plain_http(
 
         let session_id = SessionId::new(None, &host);
 
+        let fwd_state = AppState {
+            config: config.clone(),
+            store: None,
+            tokens: None,
+            rbac: None,
+            auth: None,
+            vault: vault.as_ref().clone(),
+            audit: Some(audit_sender.as_ref().clone()),
+            semantic: crate::semantic::get(),
+            tls_connector: upstream_connector.as_ref().clone(),
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
         Box::pin(async move {
             let ctx = crate::RequestContext {
                 user_id: None,
                 user_db_id: None,
                 client_addr: peer_addr,
             };
-            forward::forward_request(
-                req,
-                ctx,
-                config,
-                &upstream_connector,
-                Some(&audit_sender),
-                if vault.is_connected() {
-                    Some(vault.as_ref())
-                } else {
-                    None
-                },
-                Some(&session_id),
-                None,
-                crate::semantic::get(),
-            )
-            .await
+            forward::forward_request(req, ctx, &fwd_state, Some(&session_id)).await
         })
     });
 
@@ -569,16 +562,24 @@ async fn serve_http<S>(
 ) where
     S: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
-    let _uid = user_id;
-    let store_ref = store.clone();
+    let uid = user_id;
     let svc = service_fn(move |req: Request<Incoming>| {
-        let config = config.clone();
-        let upstream_connector = upstream_connector.clone();
-        let vault = vault.clone();
-        let audit_sender = audit_sender.clone();
         let session_id = session_id.clone();
-        let uid = _uid.clone();
-        let store_here = store_ref.clone();
+        let uid = uid.clone();
+        let store_here = store.clone();
+
+        let fwd_state = AppState {
+            config: config.clone(),
+            store: store_here,
+            tokens: None,
+            rbac: None,
+            auth: None,
+            vault: vault.as_ref().clone(),
+            audit: Some(audit_sender.as_ref().clone()),
+            semantic: crate::semantic::get(),
+            tls_connector: upstream_connector.as_ref().clone(),
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
 
         async move {
             let ctx = crate::RequestContext {
@@ -586,22 +587,7 @@ async fn serve_http<S>(
                 user_db_id,
                 client_addr: peer_addr,
             };
-            forward::forward_request(
-                req,
-                ctx,
-                config,
-                &upstream_connector,
-                Some(&audit_sender),
-                if vault.is_connected() {
-                    Some(vault.as_ref())
-                } else {
-                    None
-                },
-                Some(&session_id),
-                store_here.as_deref(),
-                crate::semantic::get(),
-            )
-            .await
+            forward::forward_request(req, ctx, &fwd_state, Some(&session_id)).await
         }
     });
 
@@ -652,7 +638,7 @@ fn generate_install_script(proxy_host: &str) -> String {
 #   1. Detects your OS and architecture
 #   2. Downloads the correct 'apx' binary to ~/.local/bin
 #   3. Runs 'apx install' which:
-#      - Downloads the CA certificate
+#      - Downloads the CA certificate to ~/.config/ai-proxy/
 #      - Builds a CA bundle (system roots + our CA)
 #      - Writes config to ~/.config/ai-proxy/env.conf
 #      - On macOS: adds CA to user login keychain (no sudo)
@@ -669,6 +655,10 @@ fn generate_install_script(proxy_host: &str) -> String {
 #   apx run opencode        # OpenCode
 #   apx run --sandbox codex # Codex CLI (needs bwrap on Linux)
 #   apx shell               # Interactive shell with proxy env
+#
+# To remove everything (if something breaks):
+#   apx uninstall           # remove CA, config, bundle
+#   apx uninstall --purge   # also remove apx binary
 #
 # Verify everything is set up:
 #   apx check               # 7 mandatory system checks

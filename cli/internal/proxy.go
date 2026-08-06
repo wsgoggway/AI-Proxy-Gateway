@@ -67,6 +67,41 @@ func DownloadCA() error {
 	return os.WriteFile(Cfg.CAFile, data, 0644)
 }
 
+// DownloadCAIfChanged fetches the proxy CA and writes it only when the local
+// copy is missing or differs. Returns true when the file was written.
+func DownloadCAIfChanged() (bool, error) {
+	u := fmt.Sprintf("http://%s:%s/ca.pem", Cfg.ProxyHost, Cfg.ProxyPort)
+	resp, err := http.Get(u)
+	if err != nil {
+		return false, fmt.Errorf("GET %s: %w", u, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return false, fmt.Errorf("GET %s returned %d", u, resp.StatusCode)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, err
+	}
+	if FileExists(Cfg.CAFile) {
+		oldData, err := os.ReadFile(Cfg.CAFile)
+		if err == nil {
+			oldCert, oldErr := ParseCert(oldData)
+			newCert, newErr := ParseCert(data)
+			if oldErr == nil && newErr == nil && CertFingerprint(oldCert) == CertFingerprint(newCert) {
+				return false, nil
+			}
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(Cfg.CAFile), 0755); err != nil {
+		return false, err
+	}
+	if err := os.WriteFile(Cfg.CAFile, data, 0644); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func BuildBundle() error {
 	sysCA := FindSystemBundle()
 	var combo []byte

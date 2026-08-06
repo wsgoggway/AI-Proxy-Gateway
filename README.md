@@ -18,6 +18,7 @@ curl -sS http://proxy.example.com:8443/install.sh | bash
 apx check            # verify 7 readiness checks
 apx run claude       # run an agent through the proxy
 apx shell            # interactive shell with proxy env
+apx uninstall        # remove all proxy files (CA, config, bundle)
 ```
 
 No root, no system trust store changes. On macOS the CA is added to the user login keychain; on Linux per-process isolation via env vars (or bwrap sandbox).

@@ -7,7 +7,7 @@
 #   1. Detects your OS and architecture
 #   2. Downloads the correct 'apx' binary to ~/.local/bin
 #   3. Runs 'apx install' which:
-#      - Downloads the CA certificate
+#      - Downloads the CA certificate to ~/.config/ai-proxy/
 #      - Builds a CA bundle (system roots + our CA)
 #      - Writes config to ~/.config/ai-proxy/env.conf
 #      - On macOS: adds CA to user login keychain (no sudo)
@@ -24,6 +24,10 @@
 #   apx run opencode        # OpenCode
 #   apx run --sandbox codex # Codex CLI (needs bwrap on Linux)
 #   apx shell               # Interactive shell with proxy env
+#
+# To remove everything (if something breaks):
+#   apx uninstall           # remove CA, config, bundle
+#   apx uninstall --purge   # also remove apx binary
 #
 # Verify everything is set up:
 #   apx check               # 7 mandatory system checks

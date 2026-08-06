@@ -187,18 +187,23 @@ fn resolve_target(host_header: &str, config: &crate::config::Config) -> TargetCo
         })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn forward_request(
     req: Request<Incoming>,
     ctx: crate::RequestContext,
-    config: Arc<crate::config::Config>,
-    tls_connector: &TlsConnector,
-    audit: Option<&crate::audit::AuditChannel>,
-    vault: Option<&crate::vault::Vault>,
+    state: &crate::state::AppState,
     session_id: Option<&crate::session::SessionId>,
-    store: Option<&crate::user_store::UserStore>,
-    semantic: Option<&crate::semantic::SemanticChecker>,
 ) -> Result<ProxyResponse, hyper::Error> {
+    // Extract fields from state as local refs — keeps the body unchanged
+    let config = state.config.as_ref();
+    let tls_connector = &state.tls_connector;
+    let audit = state.audit.as_ref();
+    let vault = if state.vault.is_connected() {
+        Some(&state.vault)
+    } else {
+        None
+    };
+    let store = state.store.as_deref();
+    let semantic = state.semantic.as_deref();
     let started = Instant::now();
     let client_addr = ctx.client_addr;
     let user_id = ctx.user_id.clone();
@@ -328,15 +333,22 @@ pub async fn forward_request(
             };
 
             if !tokens.is_empty() {
-                // Build token→value map for response detokenization (no Redis needed!)
+                // Build token→value map for response detokenization.
+                // Key is the bare core (e.g. "KEY_d51b3f") — format-independent,
+                // so find_tokens always finds a match regardless of delimiter form.
                 for (det, token) in &tokens {
-                    token_map.insert(token.clone(), det.matched_text.clone());
+                    let core = crate::dpi::token_core(token);
+                    token_map.insert(core.to_string(), det.matched_text.clone());
                 }
 
-                // Store tokens in Vault (for cross-request consistency)
+                // Store tokens in Vault (for cross-request consistency).
+                // Vault key is also the bare core — unified with find_tokens.
                 if let Some(vault) = vault {
                     for (det, token) in &tokens {
-                        let _ = vault.store(session, token, &det.matched_text).await;
+                        let core = crate::dpi::token_core(token);
+                        if let Err(e) = vault.store(session, core, &det.matched_text).await {
+                            warn!("vault_store_failed core={} error={}", core, e);
+                        }
                     }
                 }
 
@@ -455,15 +467,15 @@ pub async fn forward_request(
         let mut eml_count = 0u32;
         let mut phn_count = 0u32;
         for token in token_map.keys() {
-            if token.starts_with("‹KEY_") {
+            if token.starts_with("KEY_") {
                 key_count += 1;
-            } else if token.starts_with("‹FIO_") {
+            } else if token.starts_with("FIO_") {
                 fio_count += 1;
-            } else if token.starts_with("‹ORG_") {
+            } else if token.starts_with("ORG_") {
                 org_count += 1;
-            } else if token.starts_with("‹EML_") {
+            } else if token.starts_with("EML_") {
                 eml_count += 1;
-            } else if token.starts_with("‹PHN_") {
+            } else if token.starts_with("PHN_") {
                 phn_count += 1;
             }
         }
@@ -1080,6 +1092,9 @@ pub async fn forward_sse(
         let mut n: usize = 0;
         // Token accumulation buffer: holds partial tokens that span chunk boundaries.
         let mut buf = String::new();
+        // Raw byte buffer: accumulates bytes before UTF-8 validation to avoid
+        // from_utf8_lossy corrupting multibyte chars split across SSE chunks.
+        let mut raw_buf: Vec<u8> = Vec::new();
         // Detokenization cache: starts with in-memory map (current request tokens),
         // vault lookups are added as they resolve.
         let mut detok: std::collections::HashMap<String, String> = rev_map.clone();
@@ -1105,8 +1120,20 @@ pub async fn forward_sse(
                     break;
                 }
 
-                // Append to buffer, then detokenize complete tokens.
-                buf.push_str(&String::from_utf8_lossy(&data));
+                // Accumulate raw bytes, convert only complete UTF-8 sequences.
+                // This prevents from_utf8_lossy from corrupting multibyte chars
+                // (like ‹ U+2039 = E2 80 89) when SSE chunks split them mid-character.
+                raw_buf.extend_from_slice(&data);
+                let valid_len = match std::str::from_utf8(&raw_buf) {
+                    Ok(_) => raw_buf.len(),
+                    Err(e) => e.valid_up_to(),
+                };
+                if valid_len == 0 {
+                    continue; // incomplete UTF-8, wait for more data
+                }
+                let valid_str = std::str::from_utf8(&raw_buf[..valid_len]).unwrap();
+                buf.push_str(valid_str);
+                raw_buf = raw_buf[valid_len..].to_vec();
 
                 // Resolve all complete tokens in buffer (may need vault lookups).
                 loop {
@@ -1165,6 +1192,10 @@ pub async fn forward_sse(
                     }
                 }
             }
+        }
+        // Flush any remaining raw_buf (incomplete UTF-8 at stream end — flush as-is).
+        if !raw_buf.is_empty() {
+            buf.push_str(&String::from_utf8_lossy(&raw_buf));
         }
 
         // Flush any remaining buffer (stream ended).
@@ -1303,7 +1334,7 @@ mod tests {
                     start: 0,
                     end: 18,
                 },
-                "‹KEY_a3f2b1›".to_string(),
+                "[KEY_a3f2b1]".to_string(),
             ),
             (
                 Detection {
@@ -1313,7 +1344,7 @@ mod tests {
                     start: 20,
                     end: 30,
                 },
-                "‹FIO_9b2c7d›".to_string(),
+                "[FIO_9b2c7d]".to_string(),
             ),
         ];
 
@@ -1326,7 +1357,7 @@ mod tests {
 
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].violation_type, "SECRET");
-        assert!(events[0].masked_context.contains("‹KEY_a3f2b1›"));
+        assert!(events[0].masked_context.contains("[KEY_a3f2b1]"));
         assert_eq!(events[1].violation_type, "PII_FIO");
         assert!(
             !events
@@ -1348,7 +1379,7 @@ mod tests {
                     start: 0,
                     end: 13,
                 },
-                "‹KEY_a1b2c3›".to_string(),
+                "[KEY_a1b2c3]".to_string(),
             ),
             (
                 Detection {
@@ -1358,7 +1389,7 @@ mod tests {
                     start: 15,
                     end: 26,
                 },
-                "‹FIO_d4e5f6›".to_string(),
+                "[FIO_d4e5f6]".to_string(),
             ),
         ];
 
@@ -1366,19 +1397,19 @@ mod tests {
 
         assert_eq!(events.len(), 2);
         assert!(
-            events[0].masked_context.contains("‹KEY_"),
+            events[0].masked_context.contains("[KEY_"),
             "Context must contain KEY token"
         );
         assert!(
-            events[1].masked_context.contains("‹FIO_"),
+            events[1].masked_context.contains("[FIO_"),
             "Context must contain FIO token"
         );
         assert!(
             !events[0].masked_context.contains("secret"),
             "Context must NOT leak secret"
         );
-        assert_eq!(events[0].token, Some("‹KEY_a1b2c3›".to_string()));
-        assert_eq!(events[1].token, Some("‹FIO_d4e5f6›".to_string()));
+        assert_eq!(events[0].token, Some("[KEY_a1b2c3]".to_string()));
+        assert_eq!(events[1].token, Some("[FIO_d4e5f6]".to_string()));
         assert!(!events.iter().any(|e| e.masked_context.contains("secret")));
         assert!(!events.iter().any(|e| e.masked_context.contains("Петров")));
     }
@@ -1435,12 +1466,12 @@ mod tests {
     #[test]
     fn test_unmap_from_replaces_tokens() {
         let mut map = std::collections::HashMap::new();
-        map.insert("‹KEY_abc123›".to_string(), "sk-my-secret".to_string());
-        map.insert("‹FIO_def456›".to_string(), "Иван Иванов".to_string());
+        map.insert("KEY_abc123".to_string(), "sk-my-secret".to_string());
+        map.insert("FIO_def456".to_string(), "‹KEY_ea7b3c›".to_string());
 
-        let input = "Token: ‹KEY_abc123› user: ‹FIO_def456›";
+        let input = "[KEY_abc123] user: [FIO_def456]";
         let result = unmap_from(input, &map);
-        assert_eq!(result, "Token: sk-my-secret user: Иван Иванов");
+        assert_eq!(result, "sk-my-secret user: ‹KEY_ea7b3c›");
     }
 
     #[test]
@@ -1452,16 +1483,16 @@ mod tests {
     #[test]
     fn test_unmap_from_unknown_token() {
         let mut map = std::collections::HashMap::new();
-        map.insert("‹KEY_abc123›".to_string(), "secret".to_string());
-        let result = unmap_from("Here: ‹KEY_unknown›", &map);
-        assert_eq!(result, "Here: ‹KEY_unknown›");
+        map.insert("KEY_abc123".to_string(), "secret".to_string());
+        let result = unmap_from("Here: [KEY_999999]", &map);
+        assert_eq!(result, "Here: [KEY_999999]");
     }
 
     #[test]
     fn test_unmap_from_bare_token_fallback() {
-        // Model stripped the ‹› delimiters — bare KEY_abc123 should still resolve
+        // Model stripped delimiters — bare KEY_abc123 should still resolve
         let mut map = std::collections::HashMap::new();
-        map.insert("‹KEY_abc123›".to_string(), "sk-my-secret".to_string());
+        map.insert("KEY_abc123".to_string(), "sk-my-secret".to_string());
         let result = unmap_from("The key is KEY_abc123 here", &map);
         assert_eq!(result, "The key is sk-my-secret here");
     }

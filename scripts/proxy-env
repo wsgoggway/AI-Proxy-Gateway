@@ -21,7 +21,7 @@
 # Overrides (env):
 #   AI_PROXY_HOST            default: localhost
 #   AI_PROXY_PORT            default: 8443
-#   AI_PROXY_CA_FILE         default: $HOME/ai-proxy-ca.pem
+#   AI_PROXY_CA_FILE         default: $HOME/.config/ai-proxy/ca.pem
 #   AI_PROXY_CA_FINGERPRINT  optional sha256 (colon form) to pin
 #   AI_PROXY_NODE_OPENSSL    set to 0 to skip --use-openssl-ca
 #
@@ -42,7 +42,7 @@ fi
 
 AI_PROXY_HOST="${AI_PROXY_HOST:-localhost}"
 AI_PROXY_PORT="${AI_PROXY_PORT:-8443}"
-AI_PROXY_CA_FILE="${AI_PROXY_CA_FILE:-$HOME/ai-proxy-ca.pem}"
+AI_PROXY_CA_FILE="${AI_PROXY_CA_FILE:-$HOME/.config/ai-proxy/ca.pem}"
 CA_URL="http://${AI_PROXY_HOST}:${AI_PROXY_PORT}/ca.pem"
 
 _proxy_env_fail() { echo "proxy-env: $*" >&2; return 1 2>/dev/null || exit 1; }

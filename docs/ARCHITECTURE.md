@@ -70,8 +70,8 @@
  │  │                      ▼                                            │     │
  │  │  Для каждой Detection:                                            │     │
  │  │    token = SHA256(value + session)[:6]                            │     │
- │  │    masked = ‹KEY_b7e548› / ‹FIO_766ac9› / ‹EML_75d961› / ...      │     │
- │  │    vault.set(token → original)  (Redis, TTL 1h)                  │     │
+ │  │    masked = [KEY_b7e548] / [FIO_766ac9] / [EML_75d961] / ...      │     │
+ │  │    vault.set(token → original)  (Redis, TTL 30d)                  │     │
  │  │    token_map[token] = original                                   │     │
  │  │                      │                                            │     │
  │  │  tokenize_json_body() → masked_body (с токенами)                 │     │
@@ -87,7 +87,7 @@
  │  │  Каждое событие:                                                  │     │
  │  │    type: SECRET / PII_FIO / PII_PHONE / PII_EMAIL / PII_COMPANY  │     │
  │  │    masked: sk-*** / Иван И*** / +7 999 ***-**-67                 │     │
- │  │    token: ‹KEY_b7e548›                                            │     │
+ │  │    token: [KEY_b7e548]                                            │     │
  │  │    host: api.deepseek.com                                         │     │
  │  └───────────────────────────────────────────────────────────────────┘     │
  │                         │                                                  │
@@ -99,7 +99,7 @@
  │  │  1. TLS connect к target.host:443 (make_tls_connector)           │     │
  │  │  2. hyper Request::builder()                                      │     │
  │  │     - method, path, headers (из оригинала)                       │     │
- │  │     - body = masked_body (с токенами ‹KEY_xxx›)                  │     │
+ │  │     - body = masked_body (с токенами [KEY_xxx])                  │     │
  │  │     - content-length = len(masked_body) ← пересчитан!            │     │
  │  │  3. ALPN: http/1.1                                                │     │
  │  │  4. Отправка → ожидание ответа                                    │     │
@@ -132,14 +132,14 @@
  │  │  forward.rs: detokenize_if_needed()                               │     │
  │  │                                                                   │     │
  │  │  1. Проверить: есть ли token_map? (были токены в запросе?)       │     │
- │  │  2. Regex: \$([A-Z]+_[a-f0-9]{6})\$                              │     │
+ │  │  2. Regex: \[((?:KEY|FIO|ORG|EML|PHN)_[a-f0-9]{6})\]           │     │
  │  │  3. Для каждого найденного токена:                                │     │
  │  │     - Локально: token_map[token] → original                       │     │
  │  │     - ИЛИ: vault.get(token) → original (Redis lookup)            │     │
  │  │  4. Заменить все токены на оригинальные значения                  │     │
  │  │                                                                   │     │
  │  │  Пример:                                                          │     │
- │  │    Было:  "Используй ключ ‹KEY_b7e548› для API"                  │     │
+ │  │    Было:  "Используй ключ [KEY_b7e548] для API"                  │     │
  │  │    Стало:  "Используй ключ sk-abc123... для API"                 │     │
  │  └──────────────────────────────┬────────────────────────────────────┘     │
  │                                 │                                          │
@@ -182,11 +182,11 @@
 | 1 | TCP accept | `main.rs` | Клиент подключается к прокси, spawn задачи |
 | 2 | CONNECT / SSL Bump | `mitm.rs` | Peek → CONNECT? → loopback tunnel или cert_cache.get_or_sign → TLS handshake |
 | 3 | HTTP parse | `mitm.rs` → `forward.rs` | hyper парсит HTTP-запрос внутри туннеля |
-| 4 | DPI токенизация | `dpi.rs` | Сканирование тела: секреты → `‹KEY_xxx›`, ФИО → `‹FIO_xxx›`, и т.д. |
+| 4 | DPI токенизация | `dpi.rs` | Сканирование тела: секреты → `[KEY_xxx]`, ФИО → `[FIO_xxx]`, и т.д. |
 | 5 | Audit | `audit.rs` | Асинхронная отправка событий в канал, батч каждые 5с |
 | 6 | Upstream | `forward.rs` | TLS connect к API, отправка токенизированного тела |
 | 7 | Response | `forward.rs` | Получение ответа (включая SSE streaming) |
-| 8 | Детокенизация | `forward.rs` | Regex по `‹TOKEN›` → замена на оригинал из token_map/vault |
+| 8 | Детокенизация | `forward.rs` | Regex по `[TOKEN]` → замена на оригинал из token_map/vault |
 | 9 | Логирование | `forward.rs` | DPI=DEBUG, passthrough=TRACE, сжатое=[compressed, N bytes] |
 | 10 | Ответ клиенту | `mitm.rs` | Готовый ответ → TLS → клиент |
 
@@ -195,11 +195,11 @@
 ## Типы токенов
 
 ```
-‹KEY_b7e548›  ← Secret     (sk-xxx, токены, пароли)
-‹FIO_766ac9›  ← PiiFio     (Иван Иванов)
-‹ORG_3f2a1b›  ← PiiCompany (Acme Corp, Globex Inc)
-‹EML_75d961›  ← PiiEmail   (user@company.com)
-‹PHN_ee84ac›  ← PiiPhone   (+7 999 123-45-67)
+[KEY_b7e548]  ← Secret     (sk-xxx, токены, пароли)
+[FIO_766ac9]  ← PiiFio     (Иван Иванов)
+[ORG_3f2a1b]  ← PiiCompany (Acme Corp, Globex Inc)
+[EML_75d961]  ← PiiEmail   (user@company.com)
+[PHN_ee84ac]  ← PiiPhone   (+7 999 123-45-67)
 ```
 
 Токен = `SHA256(оригинал + session_id)[:6]` — стабильный, необратимый без vault.
@@ -209,17 +209,17 @@
 ## Хранилище токенов
 
 ```
-Запрос:  sk-abc123 → ‹KEY_b7e548›
+Запрос:  sk-abc123 → [KEY_b7e548]
          ↓
     ┌─────────────────────────────┐
-    │  Vault (Redis, TTL 1 час)   │
+    │  Vault (Redis, TTL 30 дней)   │
     │                             │
     │  KEY_b7e548 → sk-abc123     │  ← сохраняется при токенизации
     │  FIO_766ac9 → Иван Иванов   │
     │  EML_75d961 → a@b.com       │
     └─────────────────────────────┘
          ↓
-Ответ:  ‹KEY_b7e548› → sk-abc123  ← восстанавливается при детокенизации
+Ответ:  [KEY_b7e548] → sk-abc123  ← восстанавливается при детокенизации
 ```
 
 ---

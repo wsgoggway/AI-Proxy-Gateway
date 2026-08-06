@@ -5,9 +5,11 @@ mod ca;
 mod cert_cache;
 mod config;
 mod dpi;
+mod error;
 mod file_scanner;
 mod forward;
 mod metrics;
+mod middleware;
 mod mitm;
 mod names_dict;
 mod oidc;
@@ -16,6 +18,7 @@ mod rbac;
 mod revocation;
 mod semantic;
 mod session;
+mod state;
 mod tls;
 mod token;
 mod usage;
@@ -35,6 +38,8 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
+
+use crate::state::AppState;
 
 /// Request context (extracted during TLS/auth phase)
 #[derive(Clone)]
@@ -64,7 +69,6 @@ async fn run_mitm_mode(config: Arc<config::Config>) -> anyhow::Result<()> {
     // Semantic validation (LLM-based false-positive filter)
     semantic::init(&config);
 
-    // Vault (Redis)
     // Vault (Redis) — must connect if configured, else fail-closed
     let vault = Arc::new({
         match config.redis.as_ref().map(|r| r.url.clone()) {
@@ -92,38 +96,38 @@ async fn run_mitm_mode(config: Arc<config::Config>) -> anyhow::Result<()> {
         );
     }
 
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // ── Admin API (JWT auth + Casbin RBAC) ───────────────
     if let (Some(auth_ref), Some(jwt_cfg)) = (
         auth.as_ref(),
         config.auth.as_ref().and_then(|a| a.jwt.as_ref()),
     ) {
         if let Some(store) = auth_ref.store() {
-            // Initialize JWT token manager
             let tokens = Arc::new(crate::token::TokenManager::new(
                 &jwt_cfg.secret,
                 jwt_cfg.token_ttl_days,
             ));
-            // Initialize Casbin RBAC + load roles from DB
             let rbac = Arc::new(crate::rbac::Rbac::new());
             if let Err(e) = rbac.reload_from_db(&store).await {
                 warn!("rbac_reload_error error={e}");
             }
-            // Admin bind: from [auth.admin] bind, or default 127.0.0.1:8444
-            let admin_bind = config
-                .auth
-                .as_ref()
-                .and_then(|a| a.admin.as_ref())
-                .map(|a| a.bind.clone())
-                .unwrap_or_else(|| "127.0.0.1:8444".into());
-            let srv = crate::admin::AdminServer {
-                bind: admin_bind,
-                store,
+
+            let admin_state = AppState {
+                config: config.clone(),
+                store: Some(store),
+                tokens: Some(tokens),
+                rbac: Some(rbac),
                 auth: auth.clone(),
-                tokens,
-                rbac,
+                vault: vault.as_ref().clone(),
+                audit: None,
+                semantic: crate::semantic::get(),
+                tls_connector: upstream_connector.as_ref().clone(),
+                shutdown: shutdown.clone(),
             };
+
             tokio::spawn(async move {
-                let _ = crate::admin::run_admin_server(srv).await;
+                let _ = crate::admin::run_admin_server(admin_state).await;
             });
         } else {
             warn!("admin_api_skipped reason=no_db_backend");
@@ -183,7 +187,6 @@ async fn run_mitm_mode(config: Arc<config::Config>) -> anyhow::Result<()> {
         "Use 'apx run <command>' to launch apps through the proxy (per-process, not system-wide)."
     );
 
-    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
@@ -326,14 +329,7 @@ async fn main() -> anyhow::Result<()> {
     let upstream_connector = Arc::new(forward::make_tls_connector());
 
     // Semantic validation (optional LLM-based false-positive filter)
-    let semantic_checker: Option<Arc<semantic::SemanticChecker>> = config
-        .semantic
-        .as_ref()
-        .filter(|s| s.enabled)
-        .map(|s| {
-            info!("semantic_validation_enabled model={}", s.model);
-            Arc::new(semantic::SemanticChecker::new(s))
-        });
+    semantic::init(&config);
 
     let (audit_sender, mut audit_receiver) = audit::audit_channel();
     tokio::spawn(async move {
@@ -377,22 +373,36 @@ async fn main() -> anyhow::Result<()> {
     )?;
     let acceptor: TlsAcceptor = tls::build_acceptor(server_config);
 
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_clone = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        info!("shutdown_signal_received");
+        shutdown_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port)
         .parse()
         .context("Invalid address сервера")?;
     let listener = TcpListener::bind(addr).await?;
     info!("proxy_listening addr={} mode=reverse", addr);
 
-    let shutdown_rev = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let shutdown_rev_clone = shutdown_rev.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        info!("shutdown_signal_received");
-        shutdown_rev_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-    });
+    // Shared state for the reverse proxy accept loop
+    let state = AppState {
+        config: config.clone(),
+        store: None,
+        tokens: None,
+        rbac: None,
+        auth: None,
+        vault: vault.as_ref().clone(),
+        audit: Some(audit_sender.as_ref().clone()),
+        semantic: crate::semantic::get(),
+        tls_connector: upstream_connector.as_ref().clone(),
+        shutdown: shutdown.clone(),
+    };
 
     loop {
-        if shutdown_rev.load(std::sync::atomic::Ordering::SeqCst) {
+        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
             break;
         }
         let accept_fut = listener.accept();
@@ -400,178 +410,157 @@ async fn main() -> anyhow::Result<()> {
             result = accept_fut => {
                 match result {
                     Ok((stream, peer_addr)) => {
-                        if shutdown_rev.load(std::sync::atomic::Ordering::SeqCst) {
+                        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
                             break;
                         }
                         let acceptor = acceptor.clone();
-                let config = config.clone();
-                let upstream_connector = upstream_connector.clone();
-                let vault = vault.clone();
-                let revocation_checker = revocation_checker.clone();
-                let audit_sender = audit_sender.clone();
-                let semantic_checker = semantic_checker.clone();
+                        let state = state.clone();
+                        let revocation_checker = revocation_checker.clone();
 
-                tokio::spawn(async move {
-                    match acceptor.accept(stream).await {
-                        Ok(tls_stream) => {
-                            let (_io, conn) = tls_stream.get_ref();
-                            let user_id = conn
-                                .peer_certificates()
-                                .and_then(|certs| certs.first())
-                                .and_then(tls::extract_user_id_from_cert);
+                        tokio::spawn(async move {
+                            crate::metrics::ACTIVE_CONNECTIONS.inc();
+                            match acceptor.accept(stream).await {
+                                Ok(tls_stream) => {
+                                    let (_io_ref, conn) = tls_stream.get_ref();
+                                    let user_id = conn
+                                        .peer_certificates()
+                                        .and_then(|certs| certs.first())
+                                        .and_then(tls::extract_user_id_from_cert);
 
-                            let needs_oidc = mtls_enabled && user_id.is_none();
+                                    let needs_oidc = mtls_enabled && user_id.is_none();
 
-                            let ctx = RequestContext {
-                                user_id: user_id.clone(),
-                                user_db_id: None,
-                                client_addr: peer_addr,
-                            };
-
-                            let io = TokioIo::new(tls_stream);
-                            let config = config.clone();
-                            let upstream_connector = upstream_connector.clone();
-                            let vault = vault.clone();
-                            let revocation_checker = revocation_checker.clone();
-                            let audit_sender = audit_sender.clone();
-                            let semantic_checker = semantic_checker.clone();
-                            let ctx = ctx.clone();
-
-                            let svc = service_fn(move |req: Request<Incoming>| {
-                                let config = config.clone();
-                                let upstream_connector = upstream_connector.clone();
-                                let vault = vault.clone();
-                                let revocation_checker = revocation_checker.clone();
-                                let audit_sender = audit_sender.clone();
-                                let ctx = ctx.clone();
-                                let semantic_checker = semantic_checker.clone();
-                                let needs_oidc = needs_oidc;
-
-                                async move {
-                                    let path = req.uri().path().to_string();
-
-                                    // PAC file
-                                    if path == "/proxy.pac" {
-                                        let pac_content = pac::generate_pac(
-                                            &config.server.host,
-                                            config.server.port,
-                                            &config.targets,
-                                        );
-                                        return Ok(Response::builder()
-                                            .status(200)
-                                            .header(
-                                                "Content-Type",
-                                                "application/x-ns-proxy-autoconfig",
-                                            )
-                                            .body(forward::str_body(pac_content))
-                                            .unwrap());
-                                    }
-
-                                    // OIDC callback
-                                    if path == "/oidc/callback" && oidc_enabled {
-                                        return handle_oidc_callback(&req, &config);
-                                    }
-
-                                    if needs_oidc
-                                        && oidc_enabled
-                                        && let Some(ref oidc_cfg) = config.oidc
-                                    {
-                                        let state = uuid::Uuid::new_v4().to_string();
-                                        let auth_url = match (oidc::OidcConfig {
-                                            client_id: oidc_cfg.client_id.clone(),
-                                            issuer_url: oidc_cfg.issuer_url.clone(),
-                                            redirect_uri: oidc_cfg.redirect_uri.clone(),
-                                        })
-                                        .auth_url(&state) {
-                                            Ok(url) => url,
-                                            Err(e) => return Ok(forward::err_resp(StatusCode::INTERNAL_SERVER_ERROR, e)),
-                                        };
-                                        return Ok(oidc::build_redirect_response(&auth_url));
-                                    }
-
-                                    if let Some(ref uid) = ctx.user_id
-                                        && revocation_checker.is_revoked(uid).await
-                                    {
-                                        warn!(
-                                            "revoked_user user={} client={}",
-                                            uid, ctx.client_addr
-                                        );
-                                        return Ok(Response::builder()
-                                            .status(StatusCode::FORBIDDEN)
-                                            .header("Content-Type", "application/json")
-                                            .body(forward::str_body(r#"{"error":"session_revoked"}"#.to_string()))
-                                            .unwrap());
-                                    }
-
-                                    let is_websocket = req
-                                        .headers()
-                                        .get("upgrade")
-                                        .and_then(|v| v.to_str().ok())
-                                        .map(|v| v.to_lowercase() == "websocket")
-                                        .unwrap_or(false);
-
-                                    if is_websocket {
-                                        info!("websocket client={}", ctx.client_addr);
-                                        return Ok(Response::builder()
-                                            .status(StatusCode::BAD_GATEWAY)
-                                            .body(forward::str_body(
-                                                "WebSocket proxying: not yet integrated"
-                                                    .to_string()),
-                                            )
-                                            .unwrap());
-                                    }
-
-                                    // Determine session_id and effective_vault
-                                    let target_host = req
-                                        .headers()
-                                        .get("host")
-                                        .and_then(|h| h.to_str().ok())
-                                        .unwrap_or("unknown");
-                                    let session_id = crate::session::SessionId::new(
-                                        ctx.user_id.as_deref(),
-                                        target_host,
-                                    );
-                                    let effective_vault = if vault.is_connected() {
-                                        Some(vault.as_ref())
-                                    } else {
-                                        None
+                                    let ctx = RequestContext {
+                                        user_id: user_id.clone(),
+                                        user_db_id: None,
+                                        client_addr: peer_addr,
                                     };
 
-                                    forward::forward_request(
-                                        req,
-                                        ctx,
-                                        config,
-                                        &upstream_connector,
-                                        Some(&audit_sender),
-                                        effective_vault,
-                                        Some(&session_id),
-                                        None,
-                                        semantic_checker.as_deref(),
-                                    )
-                                    .await
-                                }
-                            });
+                                    let io = TokioIo::new(tls_stream);
+                                    let state = state.clone();
+                                    let revocation_checker = revocation_checker.clone();
+                                    let ctx = ctx.clone();
 
-                            if let Err(err) = http1::Builder::new().serve_connection(io, svc).await
-                            {
-                                warn!("http_error client={} error={}", peer_addr, err);
+                                    let svc = service_fn(move |req: Request<Incoming>| {
+                                        let state = state.clone();
+                                        let revocation_checker = revocation_checker.clone();
+                                        let ctx = ctx.clone();
+
+                                        async move {
+                                            let path = req.uri().path().to_string();
+
+                                            // PAC file
+                                            if path == "/proxy.pac" {
+                                                let pac_content = pac::generate_pac(
+                                                    &state.config.server.host,
+                                                    state.config.server.port,
+                                                    &state.config.targets,
+                                                );
+                                                return Ok(Response::builder()
+                                                    .status(200)
+                                                    .header(
+                                                        "Content-Type",
+                                                        "application/x-ns-proxy-autoconfig",
+                                                    )
+                                                    .body(forward::str_body(pac_content))
+                                                    .unwrap());
+                                            }
+
+                                            // OIDC callback
+                                            if path == "/oidc/callback" && oidc_enabled {
+                                                return handle_oidc_callback(&req, &state.config);
+                                            }
+
+                                            if needs_oidc
+                                                && oidc_enabled
+                                                && let Some(ref oidc_cfg) = state.config.oidc
+                                            {
+                                                let state_param = uuid::Uuid::new_v4().to_string();
+                                                let auth_url = match (oidc::OidcConfig {
+                                                    client_id: oidc_cfg.client_id.clone(),
+                                                    issuer_url: oidc_cfg.issuer_url.clone(),
+                                                    redirect_uri: oidc_cfg.redirect_uri.clone(),
+                                                })
+                                                .auth_url(&state_param) {
+                                                    Ok(url) => url,
+                                                    Err(e) => return Ok(forward::err_resp(StatusCode::INTERNAL_SERVER_ERROR, e)),
+                                                };
+                                                return Ok(oidc::build_redirect_response(&auth_url));
+                                            }
+
+                                            if let Some(ref uid) = ctx.user_id
+                                                && revocation_checker.is_revoked(uid).await
+                                            {
+                                                warn!(
+                                                    "revoked_user user={} client={}",
+                                                    uid, ctx.client_addr
+                                                );
+                                                return Ok(Response::builder()
+                                                    .status(StatusCode::FORBIDDEN)
+                                                    .header("Content-Type", "application/json")
+                                                    .body(forward::str_body(r#"{"error":"session_revoked"}"#.to_string()))
+                                                    .unwrap());
+                                            }
+
+                                            let is_websocket = req
+                                                .headers()
+                                                .get("upgrade")
+                                                .and_then(|v| v.to_str().ok())
+                                                .map(|v| v.to_lowercase() == "websocket")
+                                                .unwrap_or(false);
+
+                                            if is_websocket {
+                                                info!("websocket client={}", ctx.client_addr);
+                                                return Ok(Response::builder()
+                                                    .status(StatusCode::BAD_GATEWAY)
+                                                    .body(forward::str_body(
+                                                        "WebSocket proxying: not yet integrated"
+                                                            .to_string()),
+                                                    )
+                                                    .unwrap());
+                                            }
+
+                                            // Determine session_id
+                                            let target_host = req
+                                                .headers()
+                                                .get("host")
+                                                .and_then(|h| h.to_str().ok())
+                                                .unwrap_or("unknown");
+                                            let session_id = crate::session::SessionId::new(
+                                                ctx.user_id.as_deref(),
+                                                target_host,
+                                            );
+
+                                            forward::forward_request(
+                                                req,
+                                                ctx,
+                                                &state,
+                                                Some(&session_id),
+                                            )
+                                            .await
+                                        }
+                                    });
+
+                                    if let Err(err) = http1::Builder::new().serve_connection(io, svc).await
+                                    {
+                                        warn!("http_error client={} error={}", peer_addr, err);
+                                    }
+                                }
+                                Err(err) => {
+                                    if mtls_enabled {
+                                        warn!("mtls_failed client={} error={}", peer_addr, err);
+                                    } else {
+                                        warn!("tls_error client={} error={}", peer_addr, err);
+                                    }
+                                }
                             }
-                        }
-                        Err(err) => {
-                            if mtls_enabled {
-                                warn!("mtls_failed client={} error={}", peer_addr, err);
-                            } else {
-                                warn!("tls_error client={} error={}", peer_addr, err);
-                            }
-                        }
+                            crate::metrics::ACTIVE_CONNECTIONS.dec();
+                        });
                     }
-                });
-            }
-                        Err(err) => warn!("accept_error error={}", err),
-                    }
+                    Err(err) => warn!("accept_error error={}", err),
                 }
+            }
             _ = tokio::signal::ctrl_c() => {
-                shutdown_rev.store(true, std::sync::atomic::Ordering::SeqCst);
+                shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
                 info!("shutdown_signal_received");
                 break;
             }
